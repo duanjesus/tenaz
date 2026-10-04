@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * Durable storage for workflow histories plus the coordination primitives workers need:
@@ -53,6 +54,13 @@ public interface Journal {
 
     /** Gives a lease up early so that another worker can claim the workflow immediately. */
     void abandon(Lease lease);
+
+    /**
+     * Registers a listener that is told the id of a workflow whose history grew. Notifications
+     * are best-effort: they may be lost, repeated or late, and exist only to save callers from
+     * waiting for their next poll. The listener must not block. Returns a handle that unsubscribes.
+     */
+    Runnable subscribe(Consumer<String> listener);
 
     /** Blocks until the history is longer than {@code version}. Returns false on timeout. */
     boolean awaitChange(String workflowId, long version, Duration timeout) throws InterruptedException;

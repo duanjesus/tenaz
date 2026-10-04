@@ -22,8 +22,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import javax.sql.DataSource;
 import org.postgresql.PGConnection;
 import org.postgresql.PGNotification;
@@ -88,6 +90,7 @@ public final class PostgresJournal implements Journal, AutoCloseable {
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .build();
     private final Map<String, Set<Semaphore>> waiters = new ConcurrentHashMap<>();
+    private final List<Consumer<String>> listeners = new CopyOnWriteArrayList<>();
     private final Thread listener;
     private volatile boolean closed;
 
@@ -300,6 +303,12 @@ public final class PostgresJournal implements Journal, AutoCloseable {
     }
 
     @Override
+    public Runnable subscribe(Consumer<String> listener) {
+        listeners.add(listener);
+        return () -> listeners.remove(listener);
+    }
+
+    @Override
     public boolean awaitChange(String workflowId, long version, Duration timeout) throws InterruptedException {
         long deadline = System.nanoTime() + timeout.toNanos();
         Semaphore wake = new Semaphore(0);
@@ -441,10 +450,12 @@ public final class PostgresJournal implements Journal, AutoCloseable {
                         continue;
                     }
                     for (PGNotification notification : notifications) {
-                        Set<Semaphore> waiting = waiters.get(notification.getParameter());
+                        String workflowId = notification.getParameter();
+                        Set<Semaphore> waiting = waiters.get(workflowId);
                         if (waiting != null) {
                             waiting.forEach(Semaphore::release);
                         }
+                        listeners.forEach(listener -> listener.accept(workflowId));
                     }
                 }
             } catch (SQLException e) {

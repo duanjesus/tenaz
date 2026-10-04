@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -24,6 +26,7 @@ public final class InMemoryJournal implements Journal {
     private final Condition changed = lock.newCondition();
     private final Map<String, Entry> workflows = new HashMap<>();
     private final Set<String> active = new LinkedHashSet<>();
+    private final List<Consumer<String>> listeners = new CopyOnWriteArrayList<>();
 
     private static final class Entry {
         final String type;
@@ -164,6 +167,7 @@ public final class InMemoryJournal implements Journal {
                     if (!timer.getValue().isAfter(now)) {
                         timers.remove();
                         entry.events.add(new Event.TimerFired(timer.getKey()));
+                        listeners.forEach(listener -> listener.accept(id));
                         fired++;
                     }
                 }
@@ -204,6 +208,12 @@ public final class InMemoryJournal implements Journal {
         } finally {
             lock.unlock();
         }
+    }
+
+    @Override
+    public Runnable subscribe(Consumer<String> listener) {
+        listeners.add(listener);
+        return () -> listeners.remove(listener);
     }
 
     @Override
@@ -251,6 +261,7 @@ public final class InMemoryJournal implements Journal {
             default -> { }
         }
         changed.signalAll();
+        listeners.forEach(listener -> listener.accept(workflowId));
     }
 
     private void finish(String workflowId, Entry entry, WorkflowStatus status) {

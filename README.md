@@ -46,6 +46,11 @@ that lost its lease (crash, long GC pause, partition) cannot write: the journal 
 Decisions additionally use optimistic concurrency on the history version, so a signal that lands
 mid-replay forces a fresh replay instead of being ordered inconsistently.
 
+**The engine never touches the world directly.** It is a set of short, non-blocking tasks that get
+time, scheduling and step execution from an
+[EngineRuntime](src/main/java/dev/tenaz/engine/EngineRuntime.java). In production that is virtual
+threads and the wall clock; under test it is a single-threaded event loop driven by a seed.
+
 ## Guarantees
 
 | | |
@@ -58,7 +63,21 @@ mid-replay forces a fresh replay instead of being ordered inconsistently.
 
 ## Evidence
 
-The same test suites run against both journals.
+**Deterministic simulation.** [SimulationTest](src/test/java/dev/tenaz/sim/SimulationTest.java)
+runs a three-node cluster inside one thread, with simulated time and every source of randomness
+drawn from one seed. For thirty simulated seconds, nodes crash and restart, freeze for longer than
+their leases and wake up as zombies, run on skewed clocks, lose notifications, and see journal
+operations fail both before and after committing. Then the faults stop and the run must converge:
+every workflow finished, every effect applied exactly once, every history well-formed.
+
+- 500 seeds run on every build in about a second; 30,000 seeds (258 hours of simulated time,
+  300,000 crashes, 1.2 million journal failures) run in 36 seconds and pass.
+- A failing seed fails identically every time: `./mvnw test -Dtest=SimulationTest -Dtenaz.sim.seed=16`.
+- The simulator is itself tested for the ability to fail. With fencing removed from the journal,
+  it finds the resulting double write. With `anyOf` changed to prefer its first argument over
+  history order, it reports the broken workflow at seed 16.
+
+**Real processes.** The same test suites run against both journals.
 
 - [ChaosTest](src/test/java/dev/tenaz/ChaosTest.java) runs 300 money transfers on a three-node
   cluster while killing a random node 60 times, and asserts that every transfer completes and every
@@ -96,11 +115,14 @@ and history version are always checked against committed state. Workers claim wo
 - Payload types are plain classes (`Class<T>`); generic types such as `List<Foo>` are not supported.
 - No workflow versioning: changing the code of a workflow with executions in flight fails them.
 - `finally` blocks in workflow code run on every replay.
+- Signals are not deduplicated: a client that retries a signal after an ambiguous failure may
+  deliver it twice.
+- The simulation covers the engine on the in-memory journal. `PostgresJournal` is covered by the
+  contract, chaos and kill -9 tests instead.
 - No benchmarks yet, so no throughput claims.
 
 ## Roadmap
 
-1. Deterministic simulation testing: simulated clock, scheduler and faults under one seed
-2. History caching and batched lease renewal, then benchmarks
-3. Child workflows, cancellation, versioning
-4. Spring Boot starter and a history viewer
+1. History caching and batched lease renewal, then benchmarks
+2. Child workflows, cancellation, versioning
+3. Spring Boot starter and a history viewer

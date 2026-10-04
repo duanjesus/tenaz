@@ -16,9 +16,10 @@ import dev.tenaz.journal.Journal.History;
 import dev.tenaz.journal.Journal.Lease;
 import dev.tenaz.journal.Journal.VersionConflictException;
 import dev.tenaz.journal.Journal.WorkflowStatus;
-import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -26,12 +27,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -40,36 +37,44 @@ import java.util.concurrent.atomic.AtomicInteger;
  * each workflow is driven by whichever engine holds its lease, and is picked up by another one
  * when that engine dies.
  *
+ * <p>The engine is a set of short, non-blocking tasks run by an {@link EngineRuntime}, which is
+ * what lets the same code run on threads in production and on a seeded event loop in simulation.
+ *
  * <p>An engine whose workers were never started is a client: it can start, signal and await
  * workflows that other engines run.
  */
 public final class TenazEngine implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(TenazEngine.class.getName());
-    private static final Duration SESSION_WAIT = Duration.ofSeconds(1);
+    private static final Comparator<Lease> BY_WORKFLOW =
+            Comparator.comparing(Lease::workflowId).thenComparingLong(Lease::epoch);
 
     private final Journal journal;
     private final PayloadCodec codec;
-    private final Clock clock;
+    private final EngineRuntime runtime;
     private final String workerId;
     private final Duration leaseTtl;
     private final Duration pollInterval;
     private final Semaphore slots;
-    private final Semaphore wakeup = new Semaphore(0);
     private final Map<String, WorkflowDefinition<?, ?>> definitions = new ConcurrentHashMap<>();
-    private final Set<Session> sessions = ConcurrentHashMap.newKeySet();
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    // Ordered, so that a simulation visits sessions in the same order on every run.
+    private final ConcurrentSkipListMap<Lease, Session> sessions = new ConcurrentSkipListMap<>(BY_WORKFLOW);
+    private final SerialTask dispatcher;
+    private volatile Set<String> workerTypes = Set.of();
+    private volatile Runnable unsubscribe = () -> { };
+    private volatile Instant nextRenewal = Instant.MIN;
     private volatile boolean stopped;
     private volatile boolean crashed;
 
     private TenazEngine(Builder builder) {
         this.journal = builder.journal;
         this.codec = builder.codec;
-        this.clock = builder.clock;
+        this.runtime = builder.runtime != null ? builder.runtime : new ThreadedRuntime();
         this.workerId = builder.workerId;
         this.leaseTtl = builder.leaseTtl;
         this.pollInterval = builder.pollInterval;
         this.slots = new Semaphore(builder.maxConcurrentWorkflows);
+        this.dispatcher = new SerialTask(runtime, guarded(this::claimAvailable));
     }
 
     public static Builder builder(Journal journal) {
@@ -83,9 +88,11 @@ public final class TenazEngine implements AutoCloseable {
 
     /** Starts claiming and running workflows of the registered types. */
     public TenazEngine startWorkers() {
-        Set<String> types = Set.copyOf(definitions.keySet());
-        executor.submit(() -> dispatch(types));
-        executor.submit(this::housekeep);
+        workerTypes = Set.copyOf(definitions.keySet());
+        unsubscribe = journal.subscribe(this::onChange);
+        Duration renewEvery = leaseTtl.dividedBy(3);
+        every(pollInterval, dispatcher::request);
+        every(pollInterval.compareTo(renewEvery) < 0 ? pollInterval : renewEvery, this::housekeep);
         return this;
     }
 
@@ -99,8 +106,7 @@ public final class TenazEngine implements AutoCloseable {
         if (definition == null) {
             throw new IllegalArgumentException("unknown workflow type: " + type);
         }
-        journal.create(workflowId, new Event.WorkflowStarted(type, codec.encode(input), clock.instant()));
-        wakeup.release();
+        journal.create(workflowId, new Event.WorkflowStarted(type, codec.encode(input), runtime.clock().instant()));
         return new Handle<>(workflowId, definition.outputType());
     }
 
@@ -112,12 +118,16 @@ public final class TenazEngine implements AutoCloseable {
     @Override
     public void close() {
         stopped = true;
-        executor.shutdownNow();
-        try {
-            executor.awaitTermination(10, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        unsubscribe.run();
+        runtime.shutdown(true);
+        for (Session session : sessions.values()) {
+            try {
+                journal.abandon(session.lease);
+            } catch (RuntimeException e) {
+                // The lease will expire on its own.
+            }
         }
+        sessions.clear();
     }
 
     /**
@@ -128,7 +138,8 @@ public final class TenazEngine implements AutoCloseable {
     public void crash() {
         crashed = true;
         stopped = true;
-        executor.shutdownNow();
+        unsubscribe.run();
+        runtime.shutdown(false);
     }
 
     private Journal live() {
@@ -138,232 +149,250 @@ public final class TenazEngine implements AutoCloseable {
         return journal;
     }
 
-    private void dispatch(Set<String> types) {
-        try {
-            while (!stopped) {
-                slots.acquire();
-                Optional<Lease> lease = Optional.empty();
-                try {
-                    lease = live().claim(workerId, types, leaseTtl, clock.instant());
-                } catch (RuntimeException e) {
-                    if (stopped) {
-                        return;
-                    }
-                    LOG.log(System.Logger.Level.WARNING, "could not claim work; will retry", e);
-                } finally {
-                    if (lease.isEmpty()) {
-                        slots.release();
-                    }
-                }
-                if (lease.isEmpty()) {
-                    wakeup.tryAcquire(pollInterval.toNanos(), TimeUnit.NANOSECONDS);
-                    wakeup.drainPermits();
-                    continue;
-                }
-                Session session = new Session(lease.get());
-                sessions.add(session);
-                try {
-                    executor.submit(() -> runSession(session));
-                } catch (RejectedExecutionException e) {
-                    sessions.remove(session);
-                    slots.release();
-                    return;
+    /** Wraps a task so that it does nothing once the engine stops and cannot fail the runtime. */
+    private Runnable guarded(Runnable task) {
+        return () -> {
+            if (stopped) {
+                return;
+            }
+            try {
+                task.run();
+            } catch (EngineDead e) {
+                // crashed mid-task
+            } catch (RuntimeException e) {
+                // Shutdown interrupts tasks, and an interrupt inside a journal call looks like this.
+                if (!stopped) {
+                    LOG.log(System.Logger.Level.WARNING, "engine task failed; it will be retried", e);
                 }
             }
-        } catch (InterruptedException | EngineDead e) {
-            // stopping
+        };
+    }
+
+    private void every(Duration interval, Runnable task) {
+        Runnable guardedTask = guarded(task);
+        runtime.execute(new Runnable() {
+            @Override
+            public void run() {
+                guardedTask.run();
+                if (!stopped) {
+                    runtime.schedule(interval, this);
+                }
+            }
+        });
+    }
+
+    /** Journal notifications are only a shortcut: polling finds everything they announce. */
+    private void onChange(String workflowId) {
+        if (stopped) {
+            return;
+        }
+        Lease from = new Lease(workflowId, "", Long.MIN_VALUE);
+        Lease to = new Lease(workflowId, "", Long.MAX_VALUE);
+        sessions.subMap(from, true, to, true).values().forEach(Session::wake);
+        dispatcher.request();
+    }
+
+    private void claimAvailable() {
+        while (!stopped && slots.tryAcquire()) {
+            Optional<Lease> lease = Optional.empty();
+            try {
+                lease = live().claim(workerId, workerTypes, leaseTtl, runtime.clock().instant());
+            } finally {
+                if (lease.isEmpty()) {
+                    slots.release();
+                }
+            }
+            if (lease.isEmpty()) {
+                return;
+            }
+            Session session = new Session(lease.get());
+            sessions.put(session.lease, session);
+            session.wake();
         }
     }
 
     /** Fires due timers and keeps the leases of live sessions from expiring. */
     private void housekeep() {
-        Duration renewEvery = leaseTtl.dividedBy(3);
-        Duration tick = pollInterval.compareTo(renewEvery) < 0 ? pollInterval : renewEvery;
-        long nextRenew = System.nanoTime();
-        try {
-            while (!stopped) {
-                try {
-                    if (live().fireDueTimers(clock.instant()) > 0) {
-                        wakeup.release();
-                    }
-                    if (System.nanoTime() - nextRenew >= 0) {
-                        for (Session session : sessions) {
-                            if (!live().renew(session.lease, leaseTtl, clock.instant())) {
-                                session.fence();
-                            }
-                        }
-                        nextRenew = System.nanoTime() + renewEvery.toNanos();
-                    }
-                } catch (RuntimeException e) {
-                    // Leases that cannot be renewed simply expire; the fencing epoch keeps that safe.
-                    if (stopped) {
-                        return;
-                    }
-                    LOG.log(System.Logger.Level.WARNING, "housekeeping failed; will retry", e);
+        Instant now = runtime.clock().instant();
+        if (live().fireDueTimers(now) > 0) {
+            dispatcher.request();
+        }
+        if (!now.isBefore(nextRenewal)) {
+            nextRenewal = now.plus(leaseTtl.dividedBy(3));
+            for (Session session : sessions.values()) {
+                // A lease that cannot be renewed simply expires; the fencing epoch keeps that safe.
+                if (!live().renew(session.lease, leaseTtl, runtime.clock().instant())) {
+                    session.fence();
                 }
-                Thread.sleep(tick);
             }
-        } catch (InterruptedException | EngineDead e) {
-            // stopping
         }
     }
 
     /**
-     * Drives one workflow for as long as this engine holds its lease: replay, journal the new
-     * commands, run the steps the code is waiting on, and replay again when anything changes.
-     * The session ends when the workflow finishes or is waiting only on timers and signals.
+     * One workflow, for as long as this engine holds its lease. Each {@link #advance} replays the
+     * code, journals the new commands and starts the steps the code is waiting on; it runs again
+     * whenever a step finishes or the journal reports a change. The session ends when the
+     * workflow finishes or is waiting only on timers and signals.
      */
-    private void runSession(Session session) {
-        Lease lease = session.lease;
-        String id = lease.workflowId();
-        session.thread = Thread.currentThread();
-        boolean released = false;
-        try {
-            while (!stopped && !session.fenced) {
+    private final class Session {
+        final Lease lease;
+        final Set<Integer> launched = new HashSet<>();
+        final List<Runnable> cancellations = new ArrayList<>();
+        final AtomicInteger inFlight = new AtomicInteger();
+        final SerialTask advancing = new SerialTask(runtime, guarded(this::advance));
+        volatile boolean fenced;
+        volatile boolean ended;
+
+        Session(Lease lease) {
+            this.lease = lease;
+        }
+
+        void wake() {
+            advancing.request();
+        }
+
+        void fence() {
+            fenced = true;
+            wake();
+        }
+
+        private void advance() {
+            if (ended) {
+                return;
+            }
+            String id = lease.workflowId();
+            try {
+                if (fenced) {
+                    end(false);
+                    return;
+                }
                 History history = live().load(id).orElseThrow();
                 if (history.status() != WorkflowStatus.RUNNING) {
-                    released = true;
+                    end(true);
                     return;
                 }
                 WorkflowDefinition<?, ?> definition = definitions.get(history.workflowType());
-                Replay.Result replay = Replay.run(definition, id, history.events(), codec, clock);
-                if (stopped || session.fenced) {
-                    // An interrupt may have reached the workflow code; its outcome means nothing.
-                    return;
-                }
+                Replay.Result replay = Replay.run(definition, id, history.events(), codec, runtime.clock());
                 long version = history.version();
-                try {
-                    switch (replay.outcome()) {
-                        case Outcome.Completed completed -> {
-                            finish(lease, version, replay.newEvents(), new Event.WorkflowCompleted(completed.result()));
-                            released = true;
-                            return;
+                switch (replay.outcome()) {
+                    case Outcome.Completed completed -> {
+                        finish(version, replay.newEvents(), new Event.WorkflowCompleted(completed.result()));
+                        end(true);
+                    }
+                    case Outcome.Failed failed -> {
+                        finish(version, replay.newEvents(),
+                                new Event.WorkflowFailed(failed.errorType(), failed.message()));
+                        end(true);
+                    }
+                    case Outcome.Blocked blocked -> {
+                        if (!replay.newEvents().isEmpty()) {
+                            live().appendDecisions(lease, version, replay.newEvents());
+                            version += replay.newEvents().size();
                         }
-                        case Outcome.Failed failed -> {
-                            finish(lease, version, replay.newEvents(),
-                                    new Event.WorkflowFailed(failed.errorType(), failed.message()));
-                            released = true;
-                            return;
+                        // Steps start only after their StepScheduled is durable.
+                        for (PendingStep step : replay.pendingSteps()) {
+                            if (launched.add(step.seq())) {
+                                inFlight.incrementAndGet();
+                                attempt(step, 1, step.retry().initialBackoff());
+                            }
                         }
-                        case Outcome.Blocked blocked -> {
-                            if (!replay.newEvents().isEmpty()) {
-                                live().appendDecisions(lease, version, replay.newEvents());
-                                version += replay.newEvents().size();
-                            }
-                            // Steps start only after their StepScheduled is durable.
-                            for (PendingStep step : replay.pendingSteps()) {
-                                if (session.launched.add(step.seq())) {
-                                    session.inFlight.incrementAndGet();
-                                    session.steps.add(executor.submit(() -> runStep(session, step)));
-                                }
-                            }
-                            if (session.inFlight.get() == 0) {
-                                // A step that finished after we loaded the history has moved the
-                                // version, which makes park refuse and sends us round again.
-                                if (live().park(lease, version)) {
-                                    released = true;
-                                    return;
-                                }
-                                continue;
-                            }
-                            // Stopping and fencing interrupt this wait; the timeout is a safety net.
-                            while (!live().awaitChange(id, version, SESSION_WAIT)) {
-                                if (stopped || session.fenced) {
-                                    return;
-                                }
+                        if (inFlight.get() == 0) {
+                            // A step that finished after we loaded the history has moved the
+                            // version, which makes park refuse and sends us round again.
+                            if (live().park(lease, version)) {
+                                end(true);
+                            } else {
+                                wake();
                             }
                         }
                     }
-                } catch (VersionConflictException e) {
-                    // A signal, timer or step result landed mid-replay: replay against the new history.
                 }
+            } catch (VersionConflictException e) {
+                // A signal, timer or step result landed mid-replay: replay against the new history.
+                wake();
+            } catch (FencedException e) {
+                end(true);
+            } catch (EngineDead e) {
+                ended = true;
+            } catch (RuntimeException e) {
+                if (!stopped) {
+                    LOG.log(System.Logger.Level.WARNING, "session for workflow " + id + " aborted", e);
+                }
+                end(false);
             }
-        } catch (InterruptedException | FencedException | EngineDead | RejectedExecutionException e) {
-            // lease lost or engine stopping
-        } catch (RuntimeException | Error e) {
-            // An interrupt that lands inside a journal call surfaces as a journal failure.
-            if (!stopped && !session.fenced) {
-                LOG.log(System.Logger.Level.ERROR, "session for workflow " + id + " aborted", e);
+        }
+
+        private void finish(long version, List<Event> newEvents, Event terminal) {
+            List<Event> events = new ArrayList<>(newEvents);
+            events.add(terminal);
+            live().appendDecisions(lease, version, events);
+        }
+
+        /** @param released whether the journal already knows this engine no longer owns the workflow */
+        private void end(boolean released) {
+            ended = true;
+            synchronized (cancellations) {
+                cancellations.forEach(Runnable::run);
             }
-        } finally {
-            session.steps.forEach(step -> step.cancel(true));
-            sessions.remove(session);
+            sessions.remove(lease);
             try {
-                if (!released && !crashed) {
-                    // Shutdown interrupts this thread, and an interrupted thread cannot do I/O.
-                    Thread.interrupted();
+                if (!released && !crashed && !stopped) {
                     journal.abandon(lease);
                 }
             } catch (RuntimeException e) {
                 // The lease will expire on its own.
             } finally {
                 slots.release();
+                dispatcher.request();
             }
         }
-    }
 
-    private void finish(Lease lease, long version, List<Event> newEvents, Event terminal) {
-        List<Event> events = new ArrayList<>(newEvents);
-        events.add(terminal);
-        live().appendDecisions(lease, version, events);
-    }
-
-    private void runStep(Session session, PendingStep step) {
-        try {
-            Event outcome = execute(session.lease.workflowId(), step);
-            live().appendStepResult(session.lease, outcome);
-        } catch (InterruptedException | FencedException | EngineDead e) {
-            // The session is gone. Whoever owns the workflow now will run the step again.
-        } catch (RuntimeException | Error e) {
-            // The outcome was not journaled, so the session must not park as if it had been.
-            if (!stopped && !session.fenced) {
-                LOG.log(System.Logger.Level.ERROR, "could not journal step '" + step.name() + "'", e);
+        private void attempt(PendingStep step, int attempt, Duration backoff) {
+            StepContext context = new StepContext(lease.workflowId() + "/" + step.seq(), attempt);
+            Runnable cancel = runtime.call(() -> step.body().apply(context), (result, error) -> guarded(() -> {
+                if (ended) {
+                    return;
+                }
+                Event outcome;
+                if (error == null) {
+                    outcome = encodeResult(step, result);
+                } else if (error instanceof InterruptedException) {
+                    return;
+                } else if (error instanceof NonRetryableException || attempt >= step.retry().maxAttempts()) {
+                    outcome = new Event.StepFailed(step.seq(), error.getClass().getName(), String.valueOf(error.getMessage()));
+                } else {
+                    runtime.schedule(backoff, guarded(() -> {
+                        if (!ended) {
+                            attempt(step, attempt + 1, step.retry().next(backoff));
+                        }
+                    }));
+                    return;
+                }
+                try {
+                    live().appendStepResult(lease, outcome);
+                } catch (FencedException e) {
+                    fenced = true;
+                } catch (RuntimeException e) {
+                    // The outcome was not journaled, so the session must not park as if it had
+                    // been: give the workflow up, and whoever claims it runs the step again.
+                    if (!stopped) {
+                        LOG.log(System.Logger.Level.WARNING, "could not journal step '" + step.name() + "'", e);
+                    }
+                    fenced = true;
+                }
+                inFlight.decrementAndGet();
+                wake();
+            }).run());
+            synchronized (cancellations) {
+                cancellations.add(cancel);
             }
-            session.fence();
-        } finally {
-            session.inFlight.decrementAndGet();
         }
-    }
 
-    private Event execute(String workflowId, PendingStep step) throws InterruptedException {
-        String idempotencyKey = workflowId + "/" + step.seq();
-        Duration backoff = step.retry().initialBackoff();
-        for (int attempt = 1; ; attempt++) {
+        private Event encodeResult(PendingStep step, Object result) {
             try {
-                Object result = step.body().apply(new StepContext(idempotencyKey, attempt));
                 return new Event.StepCompleted(step.seq(), codec.encode(result));
-            } catch (InterruptedException e) {
-                throw e;
-            } catch (Exception e) {
-                if (Thread.currentThread().isInterrupted()) {
-                    throw new InterruptedException();
-                }
-                if (e instanceof NonRetryableException || attempt >= step.retry().maxAttempts()) {
-                    return new Event.StepFailed(step.seq(), e.getClass().getName(), String.valueOf(e.getMessage()));
-                }
-                Thread.sleep(backoff);
-                backoff = step.retry().next(backoff);
-            }
-        }
-    }
-
-    private static final class Session {
-        final Lease lease;
-        final Set<Integer> launched = new HashSet<>();
-        final List<Future<?>> steps = new ArrayList<>();
-        final AtomicInteger inFlight = new AtomicInteger();
-        volatile Thread thread;
-        volatile boolean fenced;
-
-        Session(Lease lease) {
-            this.lease = lease;
-        }
-
-        void fence() {
-            fenced = true;
-            Thread owner = thread;
-            if (owner != null) {
-                owner.interrupt();
+            } catch (RuntimeException e) {
+                return new Event.StepFailed(step.seq(), e.getClass().getName(), String.valueOf(e.getMessage()));
             }
         }
     }
@@ -416,7 +445,6 @@ public final class TenazEngine implements AutoCloseable {
         @Override
         public void signal(String name, Object payload) {
             journal.appendExternal(workflowId, new Event.SignalReceived(name, codec.encode(payload)));
-            wakeup.release();
         }
 
         private History history() {
@@ -428,7 +456,7 @@ public final class TenazEngine implements AutoCloseable {
     public static final class Builder {
         private final Journal journal;
         private PayloadCodec codec = new JacksonCodec();
-        private Clock clock = Clock.systemUTC();
+        private EngineRuntime runtime;
         private String workerId = "worker-" + UUID.randomUUID();
         private Duration leaseTtl = Duration.ofSeconds(10);
         private Duration pollInterval = Duration.ofMillis(50);
@@ -443,8 +471,9 @@ public final class TenazEngine implements AutoCloseable {
             return this;
         }
 
-        public Builder clock(Clock clock) {
-            this.clock = clock;
+        /** Replaces threads and wall-clock time, for running the engine under simulation. */
+        public Builder runtime(EngineRuntime runtime) {
+            this.runtime = runtime;
             return this;
         }
 
@@ -459,6 +488,7 @@ public final class TenazEngine implements AutoCloseable {
             return this;
         }
 
+        /** How often to look for work that no notification announced, such as expired leases. */
         public Builder pollInterval(Duration pollInterval) {
             this.pollInterval = pollInterval;
             return this;
