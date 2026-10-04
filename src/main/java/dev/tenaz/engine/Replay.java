@@ -9,6 +9,7 @@ import dev.tenaz.api.StepFailedException;
 import dev.tenaz.api.StepFunction;
 import dev.tenaz.api.Workflow;
 import dev.tenaz.api.WorkflowContext;
+import dev.tenaz.engine.HistoryIndex.Resolution;
 import dev.tenaz.journal.Event;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -61,7 +62,12 @@ final class Replay {
 
     static <I, O> Result run(WorkflowDefinition<I, O> definition, String workflowId, List<Event> history,
                              PayloadCodec codec, Clock clock) {
-        if (history.isEmpty() || !(history.get(0) instanceof Event.WorkflowStarted started)) {
+        return run(definition, workflowId, HistoryIndex.of(history), codec, clock);
+    }
+
+    static <I, O> Result run(WorkflowDefinition<I, O> definition, String workflowId, HistoryIndex history,
+                             PayloadCodec codec, Clock clock) {
+        if (!(history.first() instanceof Event.WorkflowStarted started)) {
             throw new IllegalStateException("history of " + workflowId + " does not begin with WorkflowStarted");
         }
         Context ctx = new Context(workflowId, history, codec, clock);
@@ -84,14 +90,12 @@ final class Replay {
         }
     }
 
-    private record Resolution(int index, Event event) {}
-
     private static final class Promise<T> implements DurablePromise<T> {
         final int resolvedAt;
         final Supplier<T> value;
 
         Promise(Resolution resolution, Supplier<T> value) {
-            this.resolvedAt = resolution == null ? -1 : resolution.index();
+            this.resolvedAt = resolution == null ? -1 : resolution.position();
             this.value = value;
         }
 
@@ -108,42 +112,26 @@ final class Replay {
         private final String workflowId;
         private final PayloadCodec codec;
         private final Clock clock;
-        private final Map<Integer, Event> commands = new HashMap<>();
-        private final Map<Integer, Resolution> resolutions = new HashMap<>();
-        private final Map<String, List<Resolution>> signals = new HashMap<>();
+        private final HistoryIndex history;
         private final Map<String, Integer> signalCursor = new HashMap<>();
         final List<Event> newEvents = new ArrayList<>();
         final List<PendingStep> pendingSteps = new ArrayList<>();
         private int nextSeq;
         private int uuidCounter;
 
-        Context(String workflowId, List<Event> history, PayloadCodec codec, Clock clock) {
+        Context(String workflowId, HistoryIndex history, PayloadCodec codec, Clock clock) {
             this.workflowId = workflowId;
+            this.history = history;
             this.codec = codec;
             this.clock = clock;
-            for (int i = 0; i < history.size(); i++) {
-                Event event = history.get(i);
-                switch (event) {
-                    case Event.StepScheduled e -> commands.put(e.seq(), e);
-                    case Event.TimerStarted e -> commands.put(e.seq(), e);
-                    case Event.SideEffectRecorded e -> commands.put(e.seq(), e);
-                    case Event.StepCompleted e -> resolutions.put(e.seq(), new Resolution(i, e));
-                    case Event.StepFailed e -> resolutions.put(e.seq(), new Resolution(i, e));
-                    case Event.TimerFired e -> resolutions.put(e.seq(), new Resolution(i, e));
-                    case Event.SignalReceived e ->
-                            signals.computeIfAbsent(e.name(), k -> new ArrayList<>()).add(new Resolution(i, e));
-                    default -> { }
-                }
-            }
         }
 
         /** Code that stops short of commands it issued in an earlier run has changed underneath us. */
         void checkHistoryConsumed() {
-            for (int seq : commands.keySet()) {
-                if (seq >= nextSeq) {
-                    throw new NonDeterminismError("history has command #" + seq + " (" + commands.get(seq)
-                            + ") but the workflow code only issued " + nextSeq + " commands");
-                }
+            int recorded = history.maxCommandSeq();
+            if (recorded >= nextSeq) {
+                throw new NonDeterminismError("history has command #" + recorded + " (" + history.command(recorded)
+                        + ") but the workflow code only issued " + nextSeq + " commands");
             }
         }
 
@@ -178,13 +166,13 @@ final class Replay {
         @Override
         public <T> DurablePromise<T> stepAsync(String name, Class<T> type, RetryPolicy retry, StepFunction<T> body) {
             int seq = nextSeq++;
-            Event recorded = commands.get(seq);
+            Event recorded = history.command(seq);
             if (recorded == null) {
                 newEvents.add(new Event.StepScheduled(seq, name));
             } else if (!(recorded instanceof Event.StepScheduled scheduled && scheduled.name().equals(name))) {
                 throw mismatch(seq, "step '" + name + "'", recorded);
             }
-            Resolution resolution = resolutions.get(seq);
+            Resolution resolution = history.resolution(seq);
             if (resolution == null) {
                 pendingSteps.add(new PendingStep(seq, name, body, retry));
             }
@@ -204,13 +192,13 @@ final class Replay {
         @Override
         public DurablePromise<Void> timer(Duration duration) {
             int seq = nextSeq++;
-            Event recorded = commands.get(seq);
+            Event recorded = history.command(seq);
             if (recorded == null) {
                 newEvents.add(new Event.TimerStarted(seq, clock.instant().plus(duration)));
             } else if (!(recorded instanceof Event.TimerStarted)) {
                 throw mismatch(seq, "timer", recorded);
             }
-            return new Promise<>(resolutions.get(seq), () -> null);
+            return new Promise<>(history.resolution(seq), () -> null);
         }
 
         @Override
@@ -221,8 +209,7 @@ final class Replay {
         @Override
         public <T> DurablePromise<T> signal(String name, Class<T> type) {
             int position = signalCursor.merge(name, 1, Integer::sum) - 1;
-            List<Resolution> received = signals.getOrDefault(name, List.of());
-            Resolution resolution = position < received.size() ? received.get(position) : null;
+            Resolution resolution = history.signal(name, position);
             return new Promise<>(resolution,
                     () -> codec.decode(((Event.SignalReceived) resolution.event()).payload(), type));
         }
@@ -245,7 +232,7 @@ final class Replay {
         @Override
         public <T> T sideEffect(Class<T> type, Supplier<T> supplier) {
             int seq = nextSeq++;
-            Event recorded = commands.get(seq);
+            Event recorded = history.command(seq);
             String value;
             if (recorded == null) {
                 value = codec.encode(supplier.get());

@@ -2,10 +2,10 @@ package dev.tenaz.journal;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Consumer;
 
 /**
  * Durable storage for workflow histories plus the coordination primitives workers need:
@@ -21,24 +21,26 @@ public interface Journal {
 
     Optional<History> load(String workflowId);
 
-    /**
-     * Claims one workflow of the given types that needs work: it has events its last owner never
-     * processed, or its owner's lease expired. Each claim bumps the workflow's epoch, which
-     * fences every earlier owner.
-     */
-    Optional<Lease> claim(String workerId, Set<String> workflowTypes, Duration ttl, Instant now);
-
-    /** Extends a lease. Returns false if the lease has been fenced. */
-    boolean renew(Lease lease, Duration ttl, Instant now);
+    /** The events from position {@code fromVersion} on; empty if there are none yet. */
+    List<Event> loadSince(String workflowId, long fromVersion);
 
     /**
-     * Appends the commands a replay produced. Fails with {@link VersionConflictException} if the
-     * history moved since it was loaded, in which case the caller must replay again.
+     * Claims up to {@code limit} workflows of the given types that need work: they have events
+     * no owner has processed, or their owner's lease expired. Each claim bumps the workflow's
+     * epoch, which fences every earlier owner.
      */
-    void appendDecisions(Lease lease, long expectedVersion, List<Event> events);
+    List<Lease> claim(String workerId, Set<String> workflowTypes, Duration ttl, Instant now, int limit);
 
-    /** Appends a step outcome. Fenced by epoch but not by version: it cannot depend on ordering. */
-    void appendStepResult(Lease lease, Event event);
+    /** Extends the leases that are still held and returns them; the rest have been fenced. */
+    Set<Lease> renew(Collection<Lease> leases, Duration ttl, Instant now);
+
+    /**
+     * Appends on behalf of the workflow's owner: step outcomes and the commands a replay
+     * produced. Fails with {@link FencedException} if the lease was lost, and with
+     * {@link VersionConflictException} if the history moved since it was read, in which case the
+     * caller must read the new events and replay.
+     */
+    void append(Lease lease, long expectedVersion, List<Event> events);
 
     /** Appends an event that comes from outside the workflow, such as a signal. */
     void appendExternal(String workflowId, Event event);
@@ -56,14 +58,23 @@ public interface Journal {
     void abandon(Lease lease);
 
     /**
-     * Registers a listener that is told the id of a workflow whose history grew. Notifications
-     * are best-effort: they may be lost, repeated or late, and exist only to save callers from
+     * Registers a listener that is told when a workflow's history grows. Notifications are
+     * best-effort: they may be lost, repeated or late, and exist only to save callers from
      * waiting for their next poll. The listener must not block. Returns a handle that unsubscribes.
      */
-    Runnable subscribe(Consumer<String> listener);
+    Runnable subscribe(ChangeListener listener);
 
     /** Blocks until the history is longer than {@code version}. Returns false on timeout. */
     boolean awaitChange(String workflowId, long version, Duration timeout) throws InterruptedException;
+
+    @FunctionalInterface
+    interface ChangeListener {
+        /**
+         * @param version   the length of the history after the change
+         * @param claimable whether the workflow has no owner, so that someone should claim it
+         */
+        void changed(String workflowId, long version, boolean claimable);
+    }
 
     record History(String workflowType, List<Event> events, WorkflowStatus status) {
         public long version() {

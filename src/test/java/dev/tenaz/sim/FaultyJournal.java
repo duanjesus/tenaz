@@ -4,10 +4,10 @@ import dev.tenaz.journal.Event;
 import dev.tenaz.journal.Journal;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
@@ -99,31 +99,31 @@ final class FaultyJournal implements Journal {
     }
 
     @Override
-    public Optional<Lease> claim(String workerId, Set<String> workflowTypes, Duration ttl, Instant now) {
-        return attempt(() -> delegate.claim(workerId, workflowTypes, ttl, now));
+    public List<Event> loadSince(String workflowId, long fromVersion) {
+        return attempt(() -> delegate.loadSince(workflowId, fromVersion));
     }
 
     @Override
-    public boolean renew(Lease lease, Duration ttl, Instant now) {
-        return attempt(() -> delegate.renew(lease, ttl, now));
+    public List<Lease> claim(String workerId, Set<String> workflowTypes, Duration ttl, Instant now, int limit) {
+        return attempt(() -> delegate.claim(workerId, workflowTypes, ttl, now, limit));
     }
 
     @Override
-    public void appendDecisions(Lease lease, long expectedVersion, List<Event> events) {
-        attempt(() -> delegate.appendDecisions(lease, expectedVersion, events));
+    public Set<Lease> renew(Collection<Lease> leases, Duration ttl, Instant now) {
+        return attempt(() -> delegate.renew(leases, ttl, now));
     }
 
     @Override
-    public void appendStepResult(Lease lease, Event event) {
+    public void append(Lease lease, long expectedVersion, List<Event> events) {
         attempt(() -> {
             try {
-                delegate.appendStepResult(lease, event);
+                delegate.append(lease, expectedVersion, events);
             } catch (FencedException e) {
                 if (faults.fencing) {
                     throw e;
                 }
                 // The deliberately broken journal: a worker that lost its lease still gets to write.
-                delegate.appendExternal(lease.workflowId(), event);
+                events.forEach(event -> delegate.appendExternal(lease.workflowId(), event));
             }
         });
     }
@@ -149,10 +149,10 @@ final class FaultyJournal implements Journal {
     }
 
     @Override
-    public Runnable subscribe(Consumer<String> listener) {
-        return delegate.subscribe(workflowId -> {
+    public Runnable subscribe(ChangeListener listener) {
+        return delegate.subscribe((workflowId, version, claimable) -> {
             if (world.random.nextDouble() >= faults.dropNotification) {
-                node.execute(() -> listener.accept(workflowId));
+                node.execute(() -> listener.changed(workflowId, version, claimable));
             }
         });
     }

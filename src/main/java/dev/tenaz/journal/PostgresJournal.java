@@ -15,8 +15,10 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -25,7 +27,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
 import javax.sql.DataSource;
 import org.postgresql.PGConnection;
 import org.postgresql.PGNotification;
@@ -33,11 +34,12 @@ import org.postgresql.PGNotification;
 /**
  * Journal backed by PostgreSQL.
  *
- * <p>Every operation is one transaction that takes the workflow's row lock first, so operations
- * on the same workflow are serialized and the lease epoch and history version are checked against
- * committed state. Claims use {@code FOR UPDATE SKIP LOCKED}, so workers never queue behind each
- * other. Waiters are woken through {@code LISTEN/NOTIFY}, with polling as a fallback in case a
- * notification is lost with its connection.
+ * <p>An append is a single statement: it bumps the workflow row's version under the conditions
+ * the caller is entitled to (the lease epoch, the expected version), and inserts the events and
+ * timers only if that update matched. One round trip, atomic, and the row lock it takes
+ * serializes writers of the same workflow. Claims use {@code FOR UPDATE SKIP LOCKED}, so workers
+ * never queue behind each other. Changes are announced through {@code LISTEN/NOTIFY}, with
+ * polling as the fallback in case a notification is lost with its connection.
  */
 public final class PostgresJournal implements Journal, AutoCloseable {
 
@@ -47,19 +49,22 @@ public final class PostgresJournal implements Journal, AutoCloseable {
     private static final long FALLBACK_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
     private static final int TIMER_BATCH = 200;
 
+    // "ready" marks an unowned workflow with events no owner has processed. Together with the
+    // lease it defines the partial index, which therefore holds only workflows that are being
+    // worked on or need to be: the ones asleep on a timer or a signal cost a claim nothing.
     private static final String SCHEMA = """
             CREATE TABLE IF NOT EXISTS tenaz_workflows (
-                id                text PRIMARY KEY,
-                type              text NOT NULL,
-                status            text NOT NULL DEFAULT 'RUNNING',
-                version           bigint NOT NULL DEFAULT 0,
-                processed_version bigint NOT NULL DEFAULT 0,
-                epoch             bigint NOT NULL DEFAULT 0,
-                lease_owner       text,
-                lease_expiry      timestamptz
+                id           text PRIMARY KEY,
+                type         text NOT NULL,
+                status       text NOT NULL DEFAULT 'RUNNING',
+                version      bigint NOT NULL DEFAULT 0,
+                ready        boolean NOT NULL DEFAULT true,
+                epoch        bigint NOT NULL DEFAULT 0,
+                lease_owner  text,
+                lease_expiry timestamptz
             );
-            CREATE INDEX IF NOT EXISTS tenaz_workflows_running
-                ON tenaz_workflows (type) WHERE status = 'RUNNING';
+            CREATE INDEX IF NOT EXISTS tenaz_workflows_claimable
+                ON tenaz_workflows (type) WHERE status = 'RUNNING' AND (ready OR lease_expiry IS NOT NULL);
             CREATE TABLE IF NOT EXISTS tenaz_events (
                 workflow_id text NOT NULL REFERENCES tenaz_workflows (id) ON DELETE CASCADE,
                 seq         bigint NOT NULL,
@@ -76,6 +81,70 @@ public final class PostgresJournal implements Journal, AutoCloseable {
             CREATE INDEX IF NOT EXISTS tenaz_timers_due ON tenaz_timers (fire_at);
             """;
 
+    private static final String CREATE = """
+            WITH w AS (
+                INSERT INTO tenaz_workflows (id, type, version) VALUES (?, ?, 1)
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+            ), e AS (
+                INSERT INTO tenaz_events (workflow_id, seq, type, payload)
+                SELECT id, 0, ?, ?::jsonb FROM w
+            )
+            SELECT pg_notify('tenaz_changes', '1 t ' || id) FROM w
+            """;
+
+    private static final String APPEND = """
+            WITH w AS (
+                UPDATE tenaz_workflows
+                   SET version = version + ?, status = ?, ready = true,
+                       lease_expiry = CASE WHEN ? THEN NULL ELSE lease_expiry END
+                 WHERE id = ? AND status = 'RUNNING'%s
+             RETURNING id, version - ? AS base, version,
+                       status = 'RUNNING' AND lease_expiry IS NULL AS claimable
+            ), e AS (
+                INSERT INTO tenaz_events (workflow_id, seq, type, payload)
+                SELECT w.id, w.base + u.ord - 1, u.type, u.payload::jsonb
+                  FROM w, unnest(?::text[], ?::text[]) WITH ORDINALITY AS u(type, payload, ord)
+            ), t AS (
+                INSERT INTO tenaz_timers (workflow_id, seq, fire_at)
+                SELECT w.id, u.seq, u.fire_at::timestamptz
+                  FROM w, unnest(?::int[], ?::text[]) AS u(seq, fire_at)
+            )
+            SELECT base, pg_notify('tenaz_changes', version || CASE WHEN claimable THEN ' t ' ELSE ' f ' END || id)
+              FROM w
+            """;
+    private static final String APPEND_OWNED =
+            APPEND.formatted(" AND epoch = ? AND lease_expiry IS NOT NULL AND version = ?");
+    private static final String APPEND_EXTERNAL = APPEND.formatted("");
+
+    private static final String CLAIM = """
+            WITH candidates AS MATERIALIZED (
+                SELECT id FROM tenaz_workflows
+                 WHERE status = 'RUNNING' AND (ready OR lease_expiry IS NOT NULL)
+                   AND type = ANY (?)
+                   AND (lease_expiry IS NULL OR lease_expiry <= ?)
+                 LIMIT ?
+                   FOR UPDATE SKIP LOCKED
+            )
+            UPDATE tenaz_workflows w
+               SET epoch = epoch + 1, lease_owner = ?, lease_expiry = ?
+              FROM candidates
+             WHERE w.id = candidates.id
+            RETURNING w.id, w.epoch
+            """;
+
+    private static final String RENEW = """
+            UPDATE tenaz_workflows w
+               SET lease_expiry = ?
+              FROM unnest(?::text[], ?::bigint[]) AS held(id, epoch)
+             WHERE w.id = held.id AND w.epoch = held.epoch
+               AND w.status = 'RUNNING' AND w.lease_expiry IS NOT NULL
+            RETURNING w.id, w.epoch
+            """;
+
+    private static final String HELD =
+            " WHERE id = ? AND epoch = ? AND status = 'RUNNING' AND lease_expiry IS NOT NULL";
+
     private static final Map<String, Class<? extends Event>> EVENT_TYPES = new HashMap<>();
 
     static {
@@ -90,7 +159,7 @@ public final class PostgresJournal implements Journal, AutoCloseable {
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .build();
     private final Map<String, Set<Semaphore>> waiters = new ConcurrentHashMap<>();
-    private final List<Consumer<String>> listeners = new CopyOnWriteArrayList<>();
+    private final List<ChangeListener> listeners = new CopyOnWriteArrayList<>();
     private final Thread listener;
     private volatile boolean closed;
 
@@ -124,124 +193,127 @@ public final class PostgresJournal implements Journal, AutoCloseable {
 
     @Override
     public boolean create(String workflowId, Event.WorkflowStarted started) {
-        return inTransaction(conn -> {
-            try (PreparedStatement insert = conn.prepareStatement(
-                    "INSERT INTO tenaz_workflows (id, type) VALUES (?, ?) ON CONFLICT (id) DO NOTHING")) {
+        return execute(conn -> {
+            try (PreparedStatement insert = conn.prepareStatement(CREATE)) {
                 insert.setString(1, workflowId);
                 insert.setString(2, started.workflowType());
-                if (insert.executeUpdate() == 0) {
-                    return false;
+                insert.setString(3, started.getClass().getSimpleName());
+                insert.setString(4, encode(started));
+                try (ResultSet rows = insert.executeQuery()) {
+                    return rows.next();
                 }
             }
-            append(conn, workflowId, 0, List.of(started));
-            return true;
         });
     }
 
     @Override
     public Optional<History> load(String workflowId) {
         // One statement, therefore one snapshot: status is derived from the events it returns.
-        List<Event> events = inTransaction(conn -> {
+        List<Event> events = loadSince(workflowId, 0);
+        if (events.isEmpty()) {
+            return Optional.empty();
+        }
+        String type = ((Event.WorkflowStarted) events.get(0)).workflowType();
+        return Optional.of(new History(type, events, statusAfter(events.get(events.size() - 1))));
+    }
+
+    @Override
+    public List<Event> loadSince(String workflowId, long fromVersion) {
+        return execute(conn -> {
             try (PreparedStatement select = conn.prepareStatement(
-                    "SELECT type, payload FROM tenaz_events WHERE workflow_id = ? ORDER BY seq")) {
+                    "SELECT type, payload FROM tenaz_events WHERE workflow_id = ? AND seq >= ? ORDER BY seq")) {
                 select.setString(1, workflowId);
+                select.setLong(2, fromVersion);
                 List<Event> loaded = new ArrayList<>();
                 try (ResultSet rows = select.executeQuery()) {
                     while (rows.next()) {
                         loaded.add(decode(rows.getString(1), rows.getString(2)));
                     }
                 }
-                return loaded;
+                return List.copyOf(loaded);
             }
         });
-        if (events.isEmpty()) {
-            return Optional.empty();
-        }
-        String type = ((Event.WorkflowStarted) events.get(0)).workflowType();
-        return Optional.of(new History(type, List.copyOf(events), statusAfter(events.get(events.size() - 1))));
     }
 
     @Override
-    public Optional<Lease> claim(String workerId, Set<String> workflowTypes, Duration ttl, Instant now) {
-        return inTransaction(conn -> {
-            try (PreparedStatement update = conn.prepareStatement("""
-                    UPDATE tenaz_workflows
-                       SET epoch = epoch + 1, lease_owner = ?, lease_expiry = ?
-                     WHERE id = (
-                           SELECT id FROM tenaz_workflows
-                            WHERE status = 'RUNNING' AND type = ANY (?)
-                              AND ((lease_expiry IS NULL AND version > processed_version) OR lease_expiry <= ?)
-                            LIMIT 1
-                              FOR UPDATE SKIP LOCKED)
-                    RETURNING id, epoch
-                    """)) {
-                update.setString(1, workerId);
-                update.setObject(2, timestamp(now.plus(ttl)));
-                update.setArray(3, conn.createArrayOf("text", workflowTypes.toArray()));
-                update.setObject(4, timestamp(now));
+    public List<Lease> claim(String workerId, Set<String> workflowTypes, Duration ttl, Instant now, int limit) {
+        return execute(conn -> {
+            try (PreparedStatement update = conn.prepareStatement(CLAIM)) {
+                update.setArray(1, conn.createArrayOf("text", workflowTypes.toArray()));
+                update.setObject(2, timestamp(now));
+                update.setInt(3, limit);
+                update.setString(4, workerId);
+                update.setObject(5, timestamp(now.plus(ttl)));
+                List<Lease> claimed = new ArrayList<>();
                 try (ResultSet rows = update.executeQuery()) {
-                    return rows.next()
-                            ? Optional.of(new Lease(rows.getString(1), workerId, rows.getLong(2)))
-                            : Optional.<Lease>empty();
+                    while (rows.next()) {
+                        claimed.add(new Lease(rows.getString(1), workerId, rows.getLong(2)));
+                    }
                 }
+                return claimed;
             }
         });
     }
 
     @Override
-    public boolean renew(Lease lease, Duration ttl, Instant now) {
-        return setExpiryIfHeld(lease, now.plus(ttl));
+    public Set<Lease> renew(Collection<Lease> leases, Duration ttl, Instant now) {
+        if (leases.isEmpty()) {
+            return Set.of();
+        }
+        Map<String, Map<Long, Lease>> byWorkflow = new HashMap<>();
+        for (Lease lease : leases) {
+            byWorkflow.computeIfAbsent(lease.workflowId(), id -> new HashMap<>()).put(lease.epoch(), lease);
+        }
+        return execute(conn -> {
+            try (PreparedStatement update = conn.prepareStatement(RENEW)) {
+                update.setObject(1, timestamp(now.plus(ttl)));
+                update.setArray(2, conn.createArrayOf("text", leases.stream().map(Lease::workflowId).toArray()));
+                update.setArray(3, conn.createArrayOf("int8", leases.stream().map(Lease::epoch).toArray()));
+                Set<Lease> held = new LinkedHashSet<>();
+                try (ResultSet rows = update.executeQuery()) {
+                    while (rows.next()) {
+                        held.add(byWorkflow.get(rows.getString(1)).get(rows.getLong(2)));
+                    }
+                }
+                return held;
+            }
+        });
     }
 
     @Override
     public void abandon(Lease lease) {
         // An expiry in the past makes the workflow claimable at once while keeping it "leased",
         // which tells the next owner that there may be steps to run again.
-        setExpiryIfHeld(lease, Instant.EPOCH);
-    }
-
-    private boolean setExpiryIfHeld(Lease lease, Instant expiry) {
-        return inTransaction(conn -> {
-            try (PreparedStatement update = conn.prepareStatement("UPDATE tenaz_workflows SET lease_expiry = ?"
-                    + " WHERE id = ? AND epoch = ? AND status = 'RUNNING' AND lease_expiry IS NOT NULL")) {
-                update.setObject(1, timestamp(expiry));
+        execute(conn -> {
+            try (PreparedStatement update = conn.prepareStatement(
+                    "UPDATE tenaz_workflows SET lease_expiry = ?" + HELD)) {
+                update.setObject(1, timestamp(Instant.EPOCH));
                 update.setString(2, lease.workflowId());
                 update.setLong(3, lease.epoch());
-                return update.executeUpdate() == 1;
+                return update.executeUpdate();
             }
         });
     }
 
     @Override
-    public void appendDecisions(Lease lease, long expectedVersion, List<Event> events) {
-        inTransaction(conn -> {
-            Row row = lockHeld(conn, lease);
-            if (row.version != expectedVersion) {
-                throw new VersionConflictException(lease.workflowId(), expectedVersion, row.version);
+    public void append(Lease lease, long expectedVersion, List<Event> events) {
+        execute(conn -> {
+            if (!append(conn, lease.workflowId(), lease, expectedVersion, events)) {
+                State state = state(conn, lease.workflowId());
+                if (state == null || !state.heldBy(lease)) {
+                    throw new FencedException(lease);
+                }
+                throw new VersionConflictException(lease.workflowId(), expectedVersion, state.version);
             }
-            append(conn, lease.workflowId(), row.version, events);
-            return null;
-        });
-    }
-
-    @Override
-    public void appendStepResult(Lease lease, Event event) {
-        inTransaction(conn -> {
-            Row row = lockHeld(conn, lease);
-            append(conn, lease.workflowId(), row.version, List.of(event));
             return null;
         });
     }
 
     @Override
     public void appendExternal(String workflowId, Event event) {
-        inTransaction(conn -> {
-            Row row = lock(conn, workflowId);
-            if (row == null) {
+        execute(conn -> {
+            if (!append(conn, workflowId, null, 0, List.of(event)) && state(conn, workflowId) == null) {
                 throw new IllegalArgumentException("unknown workflow: " + workflowId);
-            }
-            if (row.running) {
-                append(conn, workflowId, row.version, List.of(event));
             }
             return null;
         });
@@ -275,9 +347,7 @@ public final class PostgresJournal implements Journal, AutoCloseable {
             due.sort(Comparator.comparing(Due::workflowId).thenComparing(Due::seq));
             int fired = 0;
             for (Due timer : due) {
-                Row row = lock(conn, timer.workflowId());
-                if (row != null && row.running) {
-                    append(conn, timer.workflowId(), row.version, List.of(new Event.TimerFired(timer.seq())));
+                if (append(conn, timer.workflowId(), null, 0, List.of(new Event.TimerFired(timer.seq())))) {
                     fired++;
                 }
             }
@@ -287,23 +357,26 @@ public final class PostgresJournal implements Journal, AutoCloseable {
 
     @Override
     public boolean park(Lease lease, long version) {
-        return inTransaction(conn -> {
-            Row row = lockHeld(conn, lease);
-            if (row.version != version) {
-                return false;
-            }
+        return execute(conn -> {
             try (PreparedStatement update = conn.prepareStatement(
-                    "UPDATE tenaz_workflows SET processed_version = ?, lease_expiry = NULL WHERE id = ?")) {
-                update.setLong(1, version);
-                update.setString(2, lease.workflowId());
-                update.executeUpdate();
+                    "UPDATE tenaz_workflows SET ready = false, lease_expiry = NULL" + HELD + " AND version = ?")) {
+                update.setString(1, lease.workflowId());
+                update.setLong(2, lease.epoch());
+                update.setLong(3, version);
+                if (update.executeUpdate() == 1) {
+                    return true;
+                }
             }
-            return true;
+            State state = state(conn, lease.workflowId());
+            if (state == null || !state.heldBy(lease)) {
+                throw new FencedException(lease);
+            }
+            return false;
         });
     }
 
     @Override
-    public Runnable subscribe(Consumer<String> listener) {
+    public Runnable subscribe(ChangeListener listener) {
         listeners.add(listener);
         return () -> listeners.remove(listener);
     }
@@ -320,7 +393,11 @@ public final class PostgresJournal implements Journal, AutoCloseable {
         try {
             // Registered before the first read, so a change after the read cannot be missed.
             while (true) {
-                if (currentVersion(workflowId) > version) {
+                State state = execute(conn -> state(conn, workflowId));
+                if (state == null) {
+                    throw new IllegalArgumentException("unknown workflow: " + workflowId);
+                }
+                if (state.version > version) {
                     return true;
                 }
                 long remaining = deadline - System.nanoTime();
@@ -337,92 +414,67 @@ public final class PostgresJournal implements Journal, AutoCloseable {
         }
     }
 
-    private long currentVersion(String workflowId) {
-        return inTransaction(conn -> {
-            try (PreparedStatement select = conn.prepareStatement(
-                    "SELECT version FROM tenaz_workflows WHERE id = ?")) {
-                select.setString(1, workflowId);
-                try (ResultSet rows = select.executeQuery()) {
-                    if (!rows.next()) {
-                        throw new IllegalArgumentException("unknown workflow: " + workflowId);
-                    }
-                    return rows.getLong(1);
-                }
-            }
-        });
+    private record State(boolean running, long version, long epoch, boolean leased) {
+        boolean heldBy(Lease lease) {
+            return running && leased && epoch == lease.epoch();
+        }
     }
 
-    private record Row(boolean running, long version, long epoch, boolean leased) {}
-
-    private Row lock(Connection conn, String workflowId) throws SQLException {
+    private State state(Connection conn, String workflowId) throws SQLException {
         try (PreparedStatement select = conn.prepareStatement(
-                "SELECT status, version, epoch, lease_expiry IS NOT NULL FROM tenaz_workflows WHERE id = ? FOR UPDATE")) {
+                "SELECT status, version, epoch, lease_expiry IS NOT NULL FROM tenaz_workflows WHERE id = ?")) {
             select.setString(1, workflowId);
             try (ResultSet rows = select.executeQuery()) {
                 if (!rows.next()) {
                     return null;
                 }
-                return new Row("RUNNING".equals(rows.getString(1)), rows.getLong(2), rows.getLong(3),
+                return new State("RUNNING".equals(rows.getString(1)), rows.getLong(2), rows.getLong(3),
                         rows.getBoolean(4));
             }
         }
     }
 
-    private Row lockHeld(Connection conn, Lease lease) throws SQLException {
-        Row row = lock(conn, lease.workflowId());
-        if (row == null || !row.running || !row.leased || row.epoch != lease.epoch()) {
-            throw new FencedException(lease);
-        }
-        return row;
-    }
-
-    /** Appends to a workflow whose row the caller has locked. */
-    private void append(Connection conn, String workflowId, long version, List<Event> events) throws SQLException {
+    /**
+     * Appends events in one statement. With a lease, the append happens only if the lease is
+     * still held and the history is at the expected version. Returns whether it happened.
+     */
+    private boolean append(Connection conn, String workflowId, Lease lease, long expectedVersion,
+                           List<Event> events) throws SQLException {
         WorkflowStatus status = WorkflowStatus.RUNNING;
-        try (PreparedStatement insertEvent = conn.prepareStatement(
-                     "INSERT INTO tenaz_events (workflow_id, seq, type, payload) VALUES (?, ?, ?, ?::jsonb)");
-             PreparedStatement insertTimer = conn.prepareStatement(
-                     "INSERT INTO tenaz_timers (workflow_id, seq, fire_at) VALUES (?, ?, ?)")) {
-            boolean timers = false;
-            for (Event event : events) {
-                insertEvent.setString(1, workflowId);
-                insertEvent.setLong(2, version++);
-                insertEvent.setString(3, event.getClass().getSimpleName());
-                insertEvent.setString(4, encode(event));
-                insertEvent.addBatch();
-                if (event instanceof Event.TimerStarted timer) {
-                    insertTimer.setString(1, workflowId);
-                    insertTimer.setInt(2, timer.seq());
-                    insertTimer.setObject(3, timestamp(timer.fireAt()));
-                    insertTimer.addBatch();
-                    timers = true;
-                }
-                if (statusAfter(event) != WorkflowStatus.RUNNING) {
-                    status = statusAfter(event);
-                }
+        String[] types = new String[events.size()];
+        String[] payloads = new String[events.size()];
+        List<Integer> timerSeqs = new ArrayList<>();
+        List<String> timerFireAts = new ArrayList<>();
+        for (int i = 0; i < events.size(); i++) {
+            Event event = events.get(i);
+            types[i] = event.getClass().getSimpleName();
+            payloads[i] = encode(event);
+            if (event instanceof Event.TimerStarted timer) {
+                timerSeqs.add(timer.seq());
+                timerFireAts.add(timer.fireAt().toString());
             }
-            insertEvent.executeBatch();
-            if (timers) {
-                insertTimer.executeBatch();
+            if (statusAfter(event) != WorkflowStatus.RUNNING) {
+                status = statusAfter(event);
             }
         }
-        try (PreparedStatement update = conn.prepareStatement("""
-                UPDATE tenaz_workflows
-                   SET version = ?, status = ?,
-                       lease_expiry = CASE WHEN ? THEN NULL ELSE lease_expiry END
-                 WHERE id = ?
-                """)) {
-            update.setLong(1, version);
-            update.setString(2, status.name());
-            update.setBoolean(3, status != WorkflowStatus.RUNNING);
-            update.setString(4, workflowId);
-            update.executeUpdate();
-        }
-        // Delivered when the transaction commits, and not at all if it rolls back.
-        try (PreparedStatement notify = conn.prepareStatement("SELECT pg_notify(?, ?)")) {
-            notify.setString(1, CHANNEL);
-            notify.setString(2, workflowId);
-            notify.execute();
+        try (PreparedStatement statement = conn.prepareStatement(lease != null ? APPEND_OWNED : APPEND_EXTERNAL)) {
+            int p = 1;
+            statement.setInt(p++, events.size());
+            statement.setString(p++, status.name());
+            statement.setBoolean(p++, status != WorkflowStatus.RUNNING);
+            statement.setString(p++, workflowId);
+            if (lease != null) {
+                statement.setLong(p++, lease.epoch());
+                statement.setLong(p++, expectedVersion);
+            }
+            statement.setInt(p++, events.size());
+            statement.setArray(p++, conn.createArrayOf("text", types));
+            statement.setArray(p++, conn.createArrayOf("text", payloads));
+            statement.setArray(p++, conn.createArrayOf("int4", timerSeqs.toArray()));
+            statement.setArray(p, conn.createArrayOf("text", timerFireAts.toArray()));
+            try (ResultSet rows = statement.executeQuery()) {
+                return rows.next();
+            }
         }
     }
 
@@ -450,12 +502,7 @@ public final class PostgresJournal implements Journal, AutoCloseable {
                         continue;
                     }
                     for (PGNotification notification : notifications) {
-                        String workflowId = notification.getParameter();
-                        Set<Semaphore> waiting = waiters.get(workflowId);
-                        if (waiting != null) {
-                            waiting.forEach(Semaphore::release);
-                        }
-                        listeners.forEach(listener -> listener.accept(workflowId));
+                        announce(notification.getParameter());
                     }
                 }
             } catch (SQLException e) {
@@ -470,6 +517,19 @@ public final class PostgresJournal implements Journal, AutoCloseable {
                 }
             }
         }
+    }
+
+    /** @param payload the new version, whether the workflow is claimable (t or f), and its id */
+    private void announce(String payload) {
+        int space = payload.indexOf(' ');
+        long version = Long.parseLong(payload, 0, space, 10);
+        boolean claimable = payload.charAt(space + 1) == 't';
+        String workflowId = payload.substring(space + 3);
+        Set<Semaphore> waiting = waiters.get(workflowId);
+        if (waiting != null) {
+            waiting.forEach(Semaphore::release);
+        }
+        listeners.forEach(subscriber -> subscriber.changed(workflowId, version, claimable));
     }
 
     private String encode(Event event) {
@@ -499,6 +559,15 @@ public final class PostgresJournal implements Journal, AutoCloseable {
     @FunctionalInterface
     private interface Work<T> {
         T run(Connection conn) throws SQLException;
+    }
+
+    /** Runs single statements, each of which commits on its own. */
+    private <T> T execute(Work<T> work) {
+        try (Connection conn = dataSource.getConnection()) {
+            return work.run(conn);
+        } catch (SQLException e) {
+            throw new JournalException("journal operation failed", e);
+        }
     }
 
     private <T> T inTransaction(Work<T> work) {

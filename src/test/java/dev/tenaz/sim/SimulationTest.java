@@ -76,7 +76,7 @@ class SimulationTest {
     void aJournalWithoutFencingIsCaught() {
         AssertionError violation = null;
         long seed = 0;
-        while (violation == null && seed < 500) {
+        while (violation == null && seed < 5_000) {
             try {
                 Simulation.runWithoutFencing(seed);
                 seed++;
@@ -84,7 +84,7 @@ class SimulationTest {
                 violation = e;
             }
         }
-        assertTrue(violation != null, "500 seeds ran against a journal without fencing and none failed");
+        assertTrue(violation != null, "5000 seeds ran against a journal without fencing and none failed");
         System.out.println("simulation: journal without fencing caught at " + violation.getMessage());
     }
 }

@@ -3,6 +3,7 @@ package dev.tenaz.journal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
@@ -11,7 +12,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.function.Consumer;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -25,15 +25,16 @@ public final class InMemoryJournal implements Journal {
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition changed = lock.newCondition();
     private final Map<String, Entry> workflows = new HashMap<>();
-    private final Set<String> active = new LinkedHashSet<>();
-    private final List<Consumer<String>> listeners = new CopyOnWriteArrayList<>();
+    // Workflows a claim could pick: leased ones, and unleased ones with unprocessed events.
+    private final Set<String> candidates = new LinkedHashSet<>();
+    private final Set<String> withTimers = new LinkedHashSet<>();
+    private final List<ChangeListener> listeners = new CopyOnWriteArrayList<>();
 
     private static final class Entry {
         final String type;
         final List<Event> events = new ArrayList<>();
         final Map<Integer, Instant> pendingTimers = new HashMap<>();
         WorkflowStatus status = WorkflowStatus.RUNNING;
-        long processedVersion;
         long epoch;
         Instant leaseExpiry;
 
@@ -51,7 +52,6 @@ public final class InMemoryJournal implements Journal {
             }
             Entry entry = new Entry(started.workflowType());
             workflows.put(workflowId, entry);
-            active.add(workflowId);
             append(workflowId, entry, started);
             return true;
         } finally {
@@ -74,46 +74,62 @@ public final class InMemoryJournal implements Journal {
     }
 
     @Override
-    public Optional<Lease> claim(String workerId, Set<String> workflowTypes, Duration ttl, Instant now) {
+    public List<Event> loadSince(String workflowId, long fromVersion) {
         lock.lock();
         try {
-            for (String id : active) {
-                Entry entry = workflows.get(id);
-                if (!workflowTypes.contains(entry.type)) {
-                    continue;
+            Entry entry = workflows.get(workflowId);
+            if (entry == null || fromVersion >= entry.events.size()) {
+                return List.of();
+            }
+            return List.copyOf(entry.events.subList((int) fromVersion, entry.events.size()));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public List<Lease> claim(String workerId, Set<String> workflowTypes, Duration ttl, Instant now, int limit) {
+        lock.lock();
+        try {
+            List<Lease> claimed = new ArrayList<>();
+            for (String id : candidates) {
+                if (claimed.size() >= limit) {
+                    break;
                 }
-                boolean claimable = entry.leaseExpiry == null
-                        ? entry.events.size() > entry.processedVersion
-                        : !entry.leaseExpiry.isAfter(now);
-                if (claimable) {
+                Entry entry = workflows.get(id);
+                boolean claimable = entry.leaseExpiry == null || !entry.leaseExpiry.isAfter(now);
+                if (claimable && workflowTypes.contains(entry.type)) {
                     entry.epoch++;
                     entry.leaseExpiry = now.plus(ttl);
-                    return Optional.of(new Lease(id, workerId, entry.epoch));
+                    claimed.add(new Lease(id, workerId, entry.epoch));
                 }
             }
-            return Optional.empty();
+            return claimed;
         } finally {
             lock.unlock();
         }
     }
 
     @Override
-    public boolean renew(Lease lease, Duration ttl, Instant now) {
+    public Set<Lease> renew(Collection<Lease> leases, Duration ttl, Instant now) {
         lock.lock();
         try {
-            Entry entry = workflows.get(lease.workflowId());
-            if (!holds(entry, lease)) {
-                return false;
+            Set<Lease> held = new LinkedHashSet<>();
+            for (Lease lease : leases) {
+                Entry entry = workflows.get(lease.workflowId());
+                if (holds(entry, lease)) {
+                    entry.leaseExpiry = now.plus(ttl);
+                    held.add(lease);
+                }
             }
-            entry.leaseExpiry = now.plus(ttl);
-            return true;
+            return held;
         } finally {
             lock.unlock();
         }
     }
 
     @Override
-    public void appendDecisions(Lease lease, long expectedVersion, List<Event> events) {
+    public void append(Lease lease, long expectedVersion, List<Event> events) {
         lock.lock();
         try {
             Entry entry = owned(lease);
@@ -123,16 +139,6 @@ public final class InMemoryJournal implements Journal {
             for (Event event : events) {
                 append(lease.workflowId(), entry, event);
             }
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    @Override
-    public void appendStepResult(Lease lease, Event event) {
-        lock.lock();
-        try {
-            append(lease.workflowId(), owned(lease), event);
         } finally {
             lock.unlock();
         }
@@ -159,21 +165,21 @@ public final class InMemoryJournal implements Journal {
         lock.lock();
         try {
             int fired = 0;
-            for (String id : active) {
+            for (String id : List.copyOf(withTimers)) {
                 Entry entry = workflows.get(id);
+                List<Integer> due = new ArrayList<>();
                 Iterator<Map.Entry<Integer, Instant>> timers = entry.pendingTimers.entrySet().iterator();
                 while (timers.hasNext()) {
                     Map.Entry<Integer, Instant> timer = timers.next();
                     if (!timer.getValue().isAfter(now)) {
                         timers.remove();
-                        entry.events.add(new Event.TimerFired(timer.getKey()));
-                        listeners.forEach(listener -> listener.accept(id));
-                        fired++;
+                        due.add(timer.getKey());
                     }
                 }
-            }
-            if (fired > 0) {
-                changed.signalAll();
+                for (int seq : due) {
+                    append(id, entry, new Event.TimerFired(seq));
+                    fired++;
+                }
             }
             return fired;
         } finally {
@@ -189,8 +195,8 @@ public final class InMemoryJournal implements Journal {
             if (entry.events.size() != version) {
                 return false;
             }
-            entry.processedVersion = version;
             entry.leaseExpiry = null;
+            candidates.remove(lease.workflowId());
             return true;
         } finally {
             lock.unlock();
@@ -211,7 +217,7 @@ public final class InMemoryJournal implements Journal {
     }
 
     @Override
-    public Runnable subscribe(Consumer<String> listener) {
+    public Runnable subscribe(ChangeListener listener) {
         listeners.add(listener);
         return () -> listeners.remove(listener);
     }
@@ -254,20 +260,30 @@ public final class InMemoryJournal implements Journal {
 
     private void append(String workflowId, Entry entry, Event event) {
         entry.events.add(event);
+        // An event on a workflow nobody owns is work for someone to claim.
+        candidates.add(workflowId);
         switch (event) {
-            case Event.TimerStarted timer -> entry.pendingTimers.put(timer.seq(), timer.fireAt());
+            case Event.TimerStarted timer -> {
+                entry.pendingTimers.put(timer.seq(), timer.fireAt());
+                withTimers.add(workflowId);
+            }
             case Event.WorkflowCompleted ignored -> finish(workflowId, entry, WorkflowStatus.COMPLETED);
             case Event.WorkflowFailed ignored -> finish(workflowId, entry, WorkflowStatus.FAILED);
             default -> { }
         }
+        if (entry.pendingTimers.isEmpty()) {
+            withTimers.remove(workflowId);
+        }
         changed.signalAll();
-        listeners.forEach(listener -> listener.accept(workflowId));
+        long version = entry.events.size();
+        boolean claimable = entry.status == WorkflowStatus.RUNNING && entry.leaseExpiry == null;
+        listeners.forEach(listener -> listener.changed(workflowId, version, claimable));
     }
 
     private void finish(String workflowId, Entry entry, WorkflowStatus status) {
         entry.status = status;
         entry.leaseExpiry = null;
         entry.pendingTimers.clear();
-        active.remove(workflowId);
+        candidates.remove(workflowId);
     }
 }

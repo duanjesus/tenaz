@@ -23,14 +23,14 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A node of the durable execution engine. Any number of engines may share one {@link Journal};
@@ -46,6 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class TenazEngine implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(TenazEngine.class.getName());
+    private static final int CLAIM_BATCH = 64;
     private static final Comparator<Lease> BY_WORKFLOW =
             Comparator.comparing(Lease::workflowId).thenComparingLong(Lease::epoch);
 
@@ -182,32 +183,38 @@ public final class TenazEngine implements AutoCloseable {
     }
 
     /** Journal notifications are only a shortcut: polling finds everything they announce. */
-    private void onChange(String workflowId) {
+    private void onChange(String workflowId, long version, boolean claimable) {
         if (stopped) {
             return;
         }
         Lease from = new Lease(workflowId, "", Long.MIN_VALUE);
         Lease to = new Lease(workflowId, "", Long.MAX_VALUE);
-        sessions.subMap(from, true, to, true).values().forEach(Session::wake);
-        dispatcher.request();
+        sessions.subMap(from, true, to, true).values().forEach(session -> session.changed(version));
+        if (claimable) {
+            dispatcher.request();
+        }
     }
 
     private void claimAvailable() {
-        while (!stopped && slots.tryAcquire()) {
-            Optional<Lease> lease = Optional.empty();
-            try {
-                lease = live().claim(workerId, workerTypes, leaseTtl, runtime.clock().instant());
-            } finally {
-                if (lease.isEmpty()) {
-                    slots.release();
-                }
-            }
-            if (lease.isEmpty()) {
+        while (!stopped) {
+            int wanted = Math.min(slots.drainPermits(), CLAIM_BATCH);
+            if (wanted == 0) {
                 return;
             }
-            Session session = new Session(lease.get());
-            sessions.put(session.lease, session);
-            session.wake();
+            List<Lease> leases = List.of();
+            try {
+                leases = live().claim(workerId, workerTypes, leaseTtl, runtime.clock().instant(), wanted);
+            } finally {
+                slots.release(wanted - leases.size());
+            }
+            for (Lease lease : leases) {
+                Session session = new Session(lease);
+                sessions.put(lease, session);
+                session.wake();
+            }
+            if (leases.size() < wanted) {
+                return;
+            }
         }
     }
 
@@ -219,9 +226,12 @@ public final class TenazEngine implements AutoCloseable {
         }
         if (!now.isBefore(nextRenewal)) {
             nextRenewal = now.plus(leaseTtl.dividedBy(3));
-            for (Session session : sessions.values()) {
-                // A lease that cannot be renewed simply expires; the fencing epoch keeps that safe.
-                if (!live().renew(session.lease, leaseTtl, runtime.clock().instant())) {
+            // A lease that cannot be renewed simply expires; the fencing epoch keeps that safe.
+            List<Lease> held = List.copyOf(sessions.keySet());
+            Set<Lease> renewed = live().renew(held, leaseTtl, runtime.clock().instant());
+            for (Lease lease : held) {
+                Session session = sessions.get(lease);
+                if (session != null && !renewed.contains(lease)) {
                     session.fence();
                 }
             }
@@ -229,17 +239,24 @@ public final class TenazEngine implements AutoCloseable {
     }
 
     /**
-     * One workflow, for as long as this engine holds its lease. Each {@link #advance} replays the
-     * code, journals the new commands and starts the steps the code is waiting on; it runs again
-     * whenever a step finishes or the journal reports a change. The session ends when the
-     * workflow finishes or is waiting only on timers and signals.
+     * One workflow, for as long as this engine holds its lease. The session keeps the history it
+     * has read and only ever fetches what was added to it. Each {@link #advance} replays the code
+     * against that history plus the step outcomes that arrived since, journals those outcomes
+     * together with the commands they led to, and starts the steps the code is now waiting on.
+     * The session ends when the workflow finishes or is waiting only on timers and signals.
      */
     private final class Session {
         final Lease lease;
+        final HistoryIndex history = new HistoryIndex();
         final Set<Integer> launched = new HashSet<>();
         final List<Runnable> cancellations = new ArrayList<>();
-        final AtomicInteger inFlight = new AtomicInteger();
+        final Queue<Event> arrived = new ConcurrentLinkedQueue<>();
+        final List<Event> unjournaled = new ArrayList<>();
         final SerialTask advancing = new SerialTask(runtime, guarded(this::advance));
+        // Steps that were started and whose outcome is not in the journal yet.
+        int outstanding;
+        volatile long knownVersion;
+        volatile boolean behind = true;
         volatile boolean fenced;
         volatile boolean ended;
 
@@ -256,6 +273,14 @@ public final class TenazEngine implements AutoCloseable {
             wake();
         }
 
+        /** The journal announced a history of this length; ours may be missing events. */
+        void changed(long version) {
+            if (version > knownVersion) {
+                behind = true;
+                wake();
+            }
+        }
+
         private void advance() {
             if (ended) {
                 return;
@@ -266,49 +291,71 @@ public final class TenazEngine implements AutoCloseable {
                     end(false);
                     return;
                 }
-                History history = live().load(id).orElseThrow();
-                if (history.status() != WorkflowStatus.RUNNING) {
-                    end(true);
-                    return;
+                for (Event outcome = arrived.poll(); outcome != null; outcome = arrived.poll()) {
+                    unjournaled.add(outcome);
                 }
-                WorkflowDefinition<?, ?> definition = definitions.get(history.workflowType());
-                Replay.Result replay = Replay.run(definition, id, history.events(), codec, runtime.clock());
-                long version = history.version();
+                if (behind) {
+                    behind = false;
+                    live().loadSince(id, history.version()).forEach(history::add);
+                    knownVersion = history.version();
+                    if (history.last() instanceof Event.WorkflowCompleted
+                            || history.last() instanceof Event.WorkflowFailed) {
+                        end(true);
+                        return;
+                    }
+                }
+                if (!(history.first() instanceof Event.WorkflowStarted started)) {
+                    throw new IllegalStateException("workflow " + id + " has no history");
+                }
+                // Outcomes that are not durable yet are replayed as if they were, so that they
+                // and the commands they lead to are journaled in a single append.
+                HistoryIndex view = history;
+                if (!unjournaled.isEmpty()) {
+                    view = new HistoryIndex(history);
+                    unjournaled.forEach(view::add);
+                }
+                WorkflowDefinition<?, ?> definition = definitions.get(started.workflowType());
+                Replay.Result replay = Replay.run(definition, id, view, codec, runtime.clock());
+                List<Event> events = new ArrayList<>(unjournaled);
+                events.addAll(replay.newEvents());
                 switch (replay.outcome()) {
                     case Outcome.Completed completed -> {
-                        finish(version, replay.newEvents(), new Event.WorkflowCompleted(completed.result()));
+                        events.add(new Event.WorkflowCompleted(completed.result()));
+                        append(events);
                         end(true);
                     }
                     case Outcome.Failed failed -> {
-                        finish(version, replay.newEvents(),
-                                new Event.WorkflowFailed(failed.errorType(), failed.message()));
+                        events.add(new Event.WorkflowFailed(failed.errorType(), failed.message()));
+                        append(events);
                         end(true);
                     }
                     case Outcome.Blocked blocked -> {
-                        if (!replay.newEvents().isEmpty()) {
-                            live().appendDecisions(lease, version, replay.newEvents());
-                            version += replay.newEvents().size();
+                        if (!events.isEmpty()) {
+                            append(events);
+                            events.forEach(history::add);
+                            outstanding -= unjournaled.size();
+                            unjournaled.clear();
                         }
                         // Steps start only after their StepScheduled is durable.
                         for (PendingStep step : replay.pendingSteps()) {
                             if (launched.add(step.seq())) {
-                                inFlight.incrementAndGet();
+                                outstanding++;
                                 attempt(step, 1, step.retry().initialBackoff());
                             }
                         }
-                        if (inFlight.get() == 0) {
-                            // A step that finished after we loaded the history has moved the
-                            // version, which makes park refuse and sends us round again.
-                            if (live().park(lease, version)) {
+                        if (outstanding == 0) {
+                            if (live().park(lease, history.version())) {
                                 end(true);
                             } else {
+                                behind = true;
                                 wake();
                             }
                         }
                     }
                 }
             } catch (VersionConflictException e) {
-                // A signal, timer or step result landed mid-replay: replay against the new history.
+                // A signal or timer landed since we last read the history: read it and replay.
+                behind = true;
                 wake();
             } catch (FencedException e) {
                 end(true);
@@ -322,10 +369,10 @@ public final class TenazEngine implements AutoCloseable {
             }
         }
 
-        private void finish(long version, List<Event> newEvents, Event terminal) {
-            List<Event> events = new ArrayList<>(newEvents);
-            events.add(terminal);
-            live().appendDecisions(lease, version, events);
+        private void append(List<Event> events) {
+            // Set first, so that the notification of our own append does not look like news.
+            knownVersion = history.version() + events.size();
+            live().append(lease, history.version(), events);
         }
 
         /** @param released whether the journal already knows this engine no longer owns the workflow */
@@ -353,13 +400,13 @@ public final class TenazEngine implements AutoCloseable {
                 if (ended) {
                     return;
                 }
-                Event outcome;
                 if (error == null) {
-                    outcome = encodeResult(step, result);
+                    arrived.add(encodeResult(step, result));
                 } else if (error instanceof InterruptedException) {
                     return;
                 } else if (error instanceof NonRetryableException || attempt >= step.retry().maxAttempts()) {
-                    outcome = new Event.StepFailed(step.seq(), error.getClass().getName(), String.valueOf(error.getMessage()));
+                    arrived.add(new Event.StepFailed(
+                            step.seq(), error.getClass().getName(), String.valueOf(error.getMessage())));
                 } else {
                     runtime.schedule(backoff, guarded(() -> {
                         if (!ended) {
@@ -368,19 +415,6 @@ public final class TenazEngine implements AutoCloseable {
                     }));
                     return;
                 }
-                try {
-                    live().appendStepResult(lease, outcome);
-                } catch (FencedException e) {
-                    fenced = true;
-                } catch (RuntimeException e) {
-                    // The outcome was not journaled, so the session must not park as if it had
-                    // been: give the workflow up, and whoever claims it runs the step again.
-                    if (!stopped) {
-                        LOG.log(System.Logger.Level.WARNING, "could not journal step '" + step.name() + "'", e);
-                    }
-                    fenced = true;
-                }
-                inFlight.decrementAndGet();
                 wake();
             }).run());
             synchronized (cancellations) {
