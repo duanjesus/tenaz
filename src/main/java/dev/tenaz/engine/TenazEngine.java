@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A node of the durable execution engine. Any number of engines may share one {@link Journal};
@@ -63,7 +64,6 @@ public final class TenazEngine implements AutoCloseable {
     private final SerialTask dispatcher;
     private volatile Set<String> workerTypes = Set.of();
     private volatile Runnable unsubscribe = () -> { };
-    private volatile Instant nextRenewal = Instant.MIN;
     private volatile boolean stopped;
     private volatile boolean crashed;
 
@@ -91,9 +91,10 @@ public final class TenazEngine implements AutoCloseable {
     public TenazEngine startWorkers() {
         workerTypes = Set.copyOf(definitions.keySet());
         unsubscribe = journal.subscribe(this::onChange);
-        Duration renewEvery = leaseTtl.dividedBy(3);
         every(pollInterval, dispatcher::request);
-        every(pollInterval.compareTo(renewEvery) < 0 ? pollInterval : renewEvery, this::housekeep);
+        every(pollInterval, this::fireTimers);
+        // On its own schedule: nothing else the engine does may delay a heartbeat.
+        every(leaseTtl.dividedBy(3), this::renewLeases);
         return this;
     }
 
@@ -122,6 +123,7 @@ public final class TenazEngine implements AutoCloseable {
         unsubscribe.run();
         runtime.shutdown(true);
         for (Session session : sessions.values()) {
+            session.dispose();
             try {
                 journal.abandon(session.lease);
             } catch (RuntimeException e) {
@@ -141,6 +143,7 @@ public final class TenazEngine implements AutoCloseable {
         stopped = true;
         unsubscribe.run();
         runtime.shutdown(false);
+        sessions.values().forEach(Session::dispose);
     }
 
     private Journal live() {
@@ -218,32 +221,31 @@ public final class TenazEngine implements AutoCloseable {
         }
     }
 
-    /** Fires due timers and keeps the leases of live sessions from expiring. */
-    private void housekeep() {
-        Instant now = runtime.clock().instant();
-        if (live().fireDueTimers(now) > 0) {
+    private void fireTimers() {
+        if (live().fireDueTimers(runtime.clock().instant()) > 0) {
             dispatcher.request();
         }
-        if (!now.isBefore(nextRenewal)) {
-            nextRenewal = now.plus(leaseTtl.dividedBy(3));
-            // A lease that cannot be renewed simply expires; the fencing epoch keeps that safe.
-            List<Lease> held = List.copyOf(sessions.keySet());
-            Set<Lease> renewed = live().renew(held, leaseTtl, runtime.clock().instant());
-            for (Lease lease : held) {
-                Session session = sessions.get(lease);
-                if (session != null && !renewed.contains(lease)) {
-                    session.fence();
-                }
+    }
+
+    /** A lease that cannot be renewed simply expires; the fencing epoch keeps that safe. */
+    private void renewLeases() {
+        List<Lease> held = List.copyOf(sessions.keySet());
+        Set<Lease> renewed = live().renew(held, leaseTtl, runtime.clock().instant());
+        for (Lease lease : held) {
+            Session session = sessions.get(lease);
+            if (session != null && !renewed.contains(lease)) {
+                session.fence();
             }
         }
     }
 
     /**
      * One workflow, for as long as this engine holds its lease. The session keeps the history it
-     * has read and only ever fetches what was added to it. Each {@link #advance} replays the code
-     * against that history plus the step outcomes that arrived since, journals those outcomes
-     * together with the commands they led to, and starts the steps the code is now waiting on.
-     * The session ends when the workflow finishes or is waiting only on timers and signals.
+     * has read, fetching only what is added to it, and keeps the workflow's code alive between
+     * steps, so that only the first {@link #advance} replays from the top. Each advance feeds
+     * the code the step outcomes that arrived since, journals those outcomes together with the
+     * commands they led to, and starts the steps the code is now waiting on. The session ends
+     * when the workflow finishes or is waiting only on timers and signals.
      */
     private final class Session {
         final Lease lease;
@@ -253,6 +255,9 @@ public final class TenazEngine implements AutoCloseable {
         final Queue<Event> arrived = new ConcurrentLinkedQueue<>();
         final List<Event> unjournaled = new ArrayList<>();
         final SerialTask advancing = new SerialTask(runtime, guarded(this::advance));
+        // Held while the execution is in use, so that shutdown cannot discard it mid-advance.
+        final ReentrantLock busy = new ReentrantLock();
+        Replay execution;
         // Steps that were started and whose outcome is not in the journal yet.
         int outstanding;
         volatile long knownVersion;
@@ -282,6 +287,33 @@ public final class TenazEngine implements AutoCloseable {
         }
 
         private void advance() {
+            busy.lock();
+            try {
+                advanceWhileBusy();
+            } finally {
+                busy.unlock();
+            }
+        }
+
+        /** Called when the engine stops, for sessions that would otherwise never run again. */
+        void dispose() {
+            busy.lock();
+            try {
+                ended = true;
+                discardExecution();
+            } finally {
+                busy.unlock();
+            }
+        }
+
+        private void discardExecution() {
+            if (execution != null) {
+                execution.close();
+                execution = null;
+            }
+        }
+
+        private void advanceWhileBusy() {
             if (ended) {
                 return;
             }
@@ -314,8 +346,11 @@ public final class TenazEngine implements AutoCloseable {
                     view = new HistoryIndex(history);
                     unjournaled.forEach(view::add);
                 }
-                WorkflowDefinition<?, ?> definition = definitions.get(started.workflowType());
-                Replay.Result replay = Replay.run(definition, id, view, codec, runtime.clock());
+                if (execution == null) {
+                    WorkflowDefinition<?, ?> definition = definitions.get(started.workflowType());
+                    execution = new Replay(definition, id, codec, runtime.clock());
+                }
+                Replay.Result replay = execution.advance(view);
                 List<Event> events = new ArrayList<>(unjournaled);
                 events.addAll(replay.newEvents());
                 switch (replay.outcome()) {
@@ -354,13 +389,17 @@ public final class TenazEngine implements AutoCloseable {
                     }
                 }
             } catch (VersionConflictException e) {
-                // A signal or timer landed since we last read the history: read it and replay.
+                // A signal or timer landed since we last read the history. The code has already
+                // run ahead on outcomes that will now be journaled after that event, in an order
+                // it did not see, so its execution is rebuilt from the journal.
+                discardExecution();
                 behind = true;
                 wake();
             } catch (FencedException e) {
                 end(true);
             } catch (EngineDead e) {
                 ended = true;
+                discardExecution();
             } catch (RuntimeException e) {
                 if (!stopped) {
                     LOG.log(System.Logger.Level.WARNING, "session for workflow " + id + " aborted", e);
@@ -378,6 +417,7 @@ public final class TenazEngine implements AutoCloseable {
         /** @param released whether the journal already knows this engine no longer owns the workflow */
         private void end(boolean released) {
             ended = true;
+            discardExecution();
             synchronized (cancellations) {
                 cancellations.forEach(Runnable::run);
             }

@@ -55,7 +55,7 @@ class WorkflowBasicsTest {
         assertEquals(23, engine.<Integer>start("sum", "sum-1", 10).result(TIMEOUT));
         assertEquals(1, first.get());
         assertEquals(1, second.get());
-        assertTrue(runs.get() >= 3, "the code is replayed after each step");
+        assertEquals(1, runs.get(), "the code keeps its place between steps instead of being replayed");
     }
 
     @Test

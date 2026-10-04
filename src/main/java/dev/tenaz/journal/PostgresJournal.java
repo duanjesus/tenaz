@@ -16,7 +16,6 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -81,6 +80,8 @@ public final class PostgresJournal implements Journal, AutoCloseable {
             CREATE INDEX IF NOT EXISTS tenaz_timers_due ON tenaz_timers (fire_at);
             """;
 
+    private static final String LAST_SCHEMA_OBJECT = "tenaz_timers_due";
+
     private static final String CREATE = """
             WITH w AS (
                 INSERT INTO tenaz_workflows (id, type, version) VALUES (?, ?, 1)
@@ -116,6 +117,43 @@ public final class PostgresJournal implements Journal, AutoCloseable {
     private static final String APPEND_OWNED =
             APPEND.formatted(" AND epoch = ? AND lease_expiry IS NOT NULL AND version = ?");
     private static final String APPEND_EXTERNAL = APPEND.formatted("");
+
+    // Takes the due timers, then locks their workflows in id order, so that two engines firing
+    // timers of the same workflows cannot deadlock, then appends one TimerFired per timer.
+    private static final String FIRE_TIMERS = """
+            WITH due AS (
+                DELETE FROM tenaz_timers
+                 WHERE (workflow_id, seq) IN (
+                       SELECT workflow_id, seq FROM tenaz_timers
+                        WHERE fire_at <= ?
+                        ORDER BY fire_at
+                        LIMIT ?
+                          FOR UPDATE SKIP LOCKED)
+                RETURNING workflow_id, seq
+            ), numbered AS (
+                SELECT workflow_id, seq,
+                       row_number() OVER (PARTITION BY workflow_id ORDER BY seq) AS nth,
+                       count(*) OVER (PARTITION BY workflow_id) AS total
+                  FROM due
+            ), locked AS (
+                SELECT id FROM tenaz_workflows
+                 WHERE id IN (SELECT workflow_id FROM due) AND status = 'RUNNING'
+                 ORDER BY id
+                   FOR UPDATE
+            ), w AS (
+                UPDATE tenaz_workflows w
+                   SET version = w.version + c.total, ready = true
+                  FROM locked, (SELECT DISTINCT workflow_id, total FROM numbered) c
+                 WHERE w.id = locked.id AND w.id = c.workflow_id
+             RETURNING w.id, w.version - c.total AS base, w.version, c.total, w.lease_expiry IS NULL AS claimable
+            ), e AS (
+                INSERT INTO tenaz_events (workflow_id, seq, type, payload)
+                SELECT w.id, w.base + n.nth - 1, 'TimerFired', jsonb_build_object('seq', n.seq)
+                  FROM numbered n JOIN w ON w.id = n.workflow_id
+            )
+            SELECT total, pg_notify('tenaz_changes', version || CASE WHEN claimable THEN ' t ' ELSE ' f ' END || id)
+              FROM w
+            """;
 
     private static final String CLAIM = """
             WITH candidates AS MATERIALIZED (
@@ -169,11 +207,22 @@ public final class PostgresJournal implements Journal, AutoCloseable {
         this.listener = Thread.ofPlatform().daemon().name("tenaz-pg-listener").start(this::listen);
     }
 
-    /** Creates the tables if they do not exist. Safe to call from several processes at once. */
+    /**
+     * Creates the tables if they do not exist. Safe to call from several processes at once, and
+     * while engines are running: when the schema is already there it touches nothing, because
+     * even a skipped {@code CREATE INDEX IF NOT EXISTS} takes a table lock that can deadlock
+     * with the engines' own statements.
+     */
     public void migrate() {
         inTransaction(conn -> {
             try (Statement statement = conn.createStatement()) {
                 statement.execute("SELECT pg_advisory_xact_lock(" + MIGRATION_LOCK + ")");
+                try (ResultSet rows = statement.executeQuery("SELECT to_regclass('" + LAST_SCHEMA_OBJECT + "')")) {
+                    rows.next();
+                    if (rows.getString(1) != null) {
+                        return null;
+                    }
+                }
                 statement.execute(SCHEMA);
             }
             return null;
@@ -321,37 +370,18 @@ public final class PostgresJournal implements Journal, AutoCloseable {
 
     @Override
     public int fireDueTimers(Instant now) {
-        return inTransaction(conn -> {
-            record Due(String workflowId, int seq) {}
-            List<Due> due = new ArrayList<>();
-            try (PreparedStatement delete = conn.prepareStatement("""
-                    DELETE FROM tenaz_timers
-                     WHERE (workflow_id, seq) IN (
-                           SELECT workflow_id, seq FROM tenaz_timers
-                            WHERE fire_at <= ?
-                            ORDER BY fire_at
-                            LIMIT ?
-                              FOR UPDATE SKIP LOCKED)
-                    RETURNING workflow_id, seq
-                    """)) {
-                delete.setObject(1, timestamp(now));
-                delete.setInt(2, TIMER_BATCH);
-                try (ResultSet rows = delete.executeQuery()) {
+        return execute(conn -> {
+            try (PreparedStatement fire = conn.prepareStatement(FIRE_TIMERS)) {
+                fire.setObject(1, timestamp(now));
+                fire.setInt(2, TIMER_BATCH);
+                int fired = 0;
+                try (ResultSet rows = fire.executeQuery()) {
                     while (rows.next()) {
-                        due.add(new Due(rows.getString(1), rows.getInt(2)));
+                        fired += rows.getInt(1);
                     }
                 }
+                return fired;
             }
-            // Workflow rows are locked in id order so that two engines firing timers at the same
-            // time cannot deadlock on each other.
-            due.sort(Comparator.comparing(Due::workflowId).thenComparing(Due::seq));
-            int fired = 0;
-            for (Due timer : due) {
-                if (append(conn, timer.workflowId(), null, 0, List.of(new Event.TimerFired(timer.seq())))) {
-                    fired++;
-                }
-            }
-            return fired;
         });
     }
 

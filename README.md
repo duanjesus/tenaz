@@ -29,10 +29,13 @@ restart.
 (`StepScheduled`, `StepCompleted`, `TimerFired`, `SignalReceived`, ...). Nothing else is persisted:
 no stack, no variables.
 
-**State is rebuilt by replay.** To advance a workflow, the engine runs its code from the top
-against the history. Calls the history already answers return the recorded answer; the first call
-it cannot answer unwinds the code. New commands are journaled, steps are run, and the code is
-replayed again when anything changes. See [Replay.java](src/main/java/dev/tenaz/engine/Replay.java).
+**State is rebuilt by replay, once.** When an engine picks a workflow up, it runs the code from
+the top against the history: calls the history already answers return the recorded answer. At the
+first call it cannot answer, the code's virtual thread parks with its stack intact. From then on
+the engine feeds it new events and lets it run to the next unanswered call, so a step costs only
+its own work, however long the history behind it. When the engine lets go of the workflow, or
+dies, the stack is thrown away, and whoever picks the workflow up next rebuilds it by replay. See
+[Replay.java](src/main/java/dev/tenaz/engine/Replay.java).
 
 **Replay is deterministic by construction.** Workflow code can observe a pending result only by
 waiting on it, and `anyOf` picks its winner by position in the history, never by wall-clock
@@ -70,8 +73,8 @@ their leases and wake up as zombies, run on skewed clocks, lose notifications, a
 operations fail both before and after committing. Then the faults stop and the run must converge:
 every workflow finished, every effect applied exactly once, every history well-formed.
 
-- 500 seeds run on every build in about a second; 30,000 seeds (257 hours of simulated time,
-  290,000 crashes, 920,000 journal failures) run in under a minute and pass.
+- 500 seeds run on every build in a few seconds; 30,000 seeds (257 hours of simulated time,
+  290,000 crashes, 940,000 journal failures) run in under three minutes and pass.
 - A failing seed fails identically every time: `./mvnw test -Dtest=SimulationTest -Dtenaz.sim.seed=16`.
 - The simulator is itself tested for the ability to fail. With fencing removed from the journal,
   it finds the resulting double write. With `anyOf` changed to prefer its first argument over
@@ -113,37 +116,42 @@ are woken by `LISTEN/NOTIFY`, with polling as a fallback. See
 
 Steps do nothing, so these numbers are the engine's own overhead: what it costs to make a step
 durable. Measured on a laptop (Core i7-11370H, 16 GB, Windows 11) with PostgreSQL 17 in Docker
-Desktop at default settings, `fsync` on. On this setup `pgbench -N` commits 700 transactions/s
-with one client and 4,300 with 32, which is the ceiling for anything that commits per step. Runs
-on this machine vary a lot, so each figure is the range of two runs.
+Desktop at default settings, `fsync` on. For scale, on the same setup `pgbench -N` reaches about
+750 transactions/s with one client and 9,800 with 32. Each figure is the range of two runs.
 
 | Journal | Scenario | Result |
 |---|---|---|
-| PostgreSQL | 1 engine, 3,000 workflows of 5 steps | 280 to 440 workflows/s (1,400 to 2,200 steps/s) |
-| PostgreSQL | 3 engines, 3,000 workflows of 5 steps | 325 to 470 workflows/s (1,600 to 2,400 steps/s) |
-| PostgreSQL | idle engine, one 5-step workflow at a time | p50 35 ms, p99 90 to 115 ms |
-| PostgreSQL | one workflow of 1,000 sequential steps | 400 to 540 steps/s |
-| in-memory | 1 engine, 20,000 workflows of 5 steps | 16,000 to 19,000 workflows/s |
-| in-memory | one workflow of 5,000 sequential steps | 1,200 to 1,700 steps/s |
+| PostgreSQL | 1 engine, 3,000 workflows of 5 steps | 520 to 550 workflows/s (2,600 to 2,800 steps/s) |
+| PostgreSQL | 3 engines, 3,000 workflows of 5 steps | 580 to 620 workflows/s (2,900 to 3,100 steps/s) |
+| PostgreSQL | idle engine, one 5-step workflow at a time | p50 33 ms, p99 37 to 41 ms |
+| PostgreSQL | one workflow of 1,000 sequential steps | 1,050 to 1,085 steps/s |
+| in-memory | 1 engine, 20,000 workflows of 5 steps | 21,000 to 21,500 workflows/s (105,000 steps/s) |
+| in-memory | one workflow of 5,000 sequential steps | 40,000 to 43,500 steps/s |
 
 Reading them:
 
-- A 5-step workflow costs 8 commits (create, claim, first command, one per step), so 440
-  workflows/s is about 3,500 commits/s: the engine is close to what this database can commit, and
-  adding engines adds little because the database, not the engine, is the limit.
+- A 5-step workflow costs 8 commits (create, claim, first command, one per step), so 550
+  workflows/s is about 4,400 commits/s, roughly half of what `pgbench` gets out of this database.
+  Three engines add little over one: the engines are not the limit.
 - Latency on an idle engine is those same 8 commits back to back.
 - The in-memory figures show what the engine costs without a database: about 10 microseconds per
-  step for short workflows.
-- Long workflows are slower per step because every step replays the workflow code from the top.
+  step.
+- A step in a long workflow costs the same as a step in a short one, because the code is not
+  replayed between steps.
 
-The work in this milestone was measured against the commit before it with the same harness:
-throughput went from 85-103 to 280-440 workflows/s, the 1,000-step workflow from 46-66 to 400-540
-steps/s, and idle p50 latency from 82-101 ms to 35 ms. The gains came from keeping each
-workflow's history in its session and fetching only new events, making an append one statement
-instead of a five-statement transaction, journaling a step's outcome together with the next
-command, and claiming and renewing leases in batches. A partial index keeps sleeping workflows out
-of the claim path: with 200,000 of them in the table, a claim reads only the 50 rows that need
-work.
+How it got here, each change measured back to back against the commit before it:
+
+- Fetching only new events, appending in one statement instead of a five-statement transaction,
+  journaling a step's outcome together with the next command, and claiming and renewing leases in
+  batches took PostgreSQL throughput from 85-103 to 280-440 workflows/s and the 1,000-step
+  workflow from 46-66 to 400-540 steps/s.
+- Keeping the workflow's stack alive between steps took the 5,000-step workflow in memory from
+  1,200-1,700 to 40,000 steps/s.
+- A partial index keeps sleeping workflows out of the claim path: with 200,000 of them in the
+  table, a claim reads only the 50 rows that need work.
+
+This laptop is noisy: the same benchmark has varied by a factor of two between runs minutes
+apart, so treat every figure as an order of magnitude.
 
 ```
 ./mvnw -q test-compile exec:java -Dexec.mainClass=dev.tenaz.bench.Benchmark -Dexec.classpathScope=test
@@ -151,14 +159,15 @@ work.
 
 ## Limitations
 
-- Every step replays the workflow code from the top, so CPU cost grows with the square of a
-  workflow's length: fine for hundreds of steps, slow for many thousands.
+- A workflow that is running holds a virtual thread, and its stack, on the engine that owns it.
+  Workflows waiting only on timers or signals hold nothing.
 - The benchmarks are from one laptop with the database in a local container. They say nothing
   about a real server or a network between engine and database.
 - Retry attempts are counted per worker; a takeover restarts the count.
 - Payload types are plain classes (`Class<T>`); generic types such as `List<Foo>` are not supported.
 - No workflow versioning: changing the code of a workflow with executions in flight fails them.
-- `finally` blocks in workflow code run on every replay.
+- `finally` blocks in workflow code also run whenever an engine lets go of the workflow, not only
+  when the workflow ends.
 - Signals are not deduplicated: a client that retries a signal after an ambiguous failure may
   deliver it twice.
 - The simulation covers the engine on the in-memory journal. `PostgresJournal` is covered by the
@@ -166,6 +175,5 @@ work.
 
 ## Roadmap
 
-1. Keep the workflow's stack alive between steps instead of replaying from the top
-2. Child workflows, cancellation, versioning
-3. Spring Boot starter and a history viewer
+1. Child workflows, cancellation, versioning
+2. Spring Boot starter and a history viewer

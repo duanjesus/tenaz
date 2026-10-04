@@ -49,8 +49,18 @@ public final class PostgresTestSupport {
     public static PostgresJournal freshJournal() {
         PostgresJournal journal = new PostgresJournal(dataSource());
         journal.migrate();
-        execute("TRUNCATE tenaz_workflows CASCADE");
-        return journal;
+        // A statement of an engine that the previous test crashed may still be running in the
+        // database, and TRUNCATE takes its locks in a different order than that statement does.
+        for (int attempt = 1; ; attempt++) {
+            try {
+                execute("TRUNCATE tenaz_workflows CASCADE");
+                return journal;
+            } catch (IllegalStateException e) {
+                if (attempt == 5) {
+                    throw e;
+                }
+            }
+        }
     }
 
     public static void execute(String sql) {

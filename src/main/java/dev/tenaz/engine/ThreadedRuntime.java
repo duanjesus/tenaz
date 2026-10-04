@@ -7,13 +7,24 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 
-/** The production runtime: one virtual thread per task, wall-clock time. */
+/**
+ * The production runtime: one virtual thread per task, wall-clock time.
+ *
+ * <p>Engine tasks and step bodies run on separate executors because they stop differently. A
+ * step body is user code that may block for as long as it likes, so shutdown interrupts it. An
+ * engine task is short and may be in the middle of a journal call, so shutdown lets it finish:
+ * interrupting it would abandon a statement that the database keeps executing.
+ */
 final class ThreadedRuntime implements EngineRuntime {
 
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    private final ExecutorService tasks = Executors.newVirtualThreadPerTaskExecutor();
+    private final ExecutorService steps = Executors.newVirtualThreadPerTaskExecutor();
+    private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(
+            Thread.ofPlatform().daemon().name("tenaz-timer").factory());
 
     @Override
     public Clock clock() {
@@ -23,7 +34,7 @@ final class ThreadedRuntime implements EngineRuntime {
     @Override
     public void execute(Runnable task) {
         try {
-            executor.execute(task);
+            tasks.execute(task);
         } catch (RejectedExecutionException e) {
             // shut down
         }
@@ -31,20 +42,17 @@ final class ThreadedRuntime implements EngineRuntime {
 
     @Override
     public void schedule(Duration delay, Runnable task) {
-        execute(() -> {
-            try {
-                Thread.sleep(delay);
-            } catch (InterruptedException e) {
-                return;
-            }
-            task.run();
-        });
+        try {
+            timer.schedule(() -> execute(task), delay.toNanos(), TimeUnit.NANOSECONDS);
+        } catch (RejectedExecutionException e) {
+            // shut down
+        }
     }
 
     @Override
     public <T> Runnable call(Callable<T> body, BiConsumer<T, Throwable> then) {
         try {
-            Future<?> running = executor.submit(() -> {
+            Future<?> running = steps.submit(() -> {
                 T result;
                 try {
                     result = body.call();
@@ -62,10 +70,13 @@ final class ThreadedRuntime implements EngineRuntime {
 
     @Override
     public void shutdown(boolean awaitTermination) {
-        executor.shutdownNow();
+        timer.shutdownNow();
+        steps.shutdownNow();
+        tasks.shutdown();
         if (awaitTermination) {
             try {
-                executor.awaitTermination(10, TimeUnit.SECONDS);
+                tasks.awaitTermination(10, TimeUnit.SECONDS);
+                steps.awaitTermination(10, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

@@ -1,6 +1,7 @@
 package dev.tenaz.engine;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -14,6 +15,8 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class ReplayTest {
@@ -64,6 +67,51 @@ class ReplayTest {
 
         Outcome.Failed failed = assertInstanceOf(Outcome.Failed.class, result.outcome());
         assertEquals(NonDeterminismError.class.getName(), failed.errorType());
+    }
+
+    @Test
+    void aLiveExecutionContinuesFromWhereItStoppedInsteadOfStartingOver() {
+        AtomicInteger entries = new AtomicInteger();
+        var definition = new WorkflowDefinition<>("test", String.class, String.class, (ctx, in) -> {
+            entries.incrementAndGet();
+            String a = ctx.step("a", String.class, step -> "unused");
+            return a + ctx.step("b", String.class, step -> "unused");
+        });
+        HistoryIndex history = HistoryIndex.of(List.of(STARTED));
+
+        try (Replay replay = new Replay(definition, "wf-1", new JacksonCodec(), Clock.systemUTC())) {
+            Replay.Result first = replay.advance(history);
+            assertEquals(List.of(new Event.StepScheduled(0, "a")), first.newEvents());
+
+            first.newEvents().forEach(history::add);
+            history.add(new Event.StepCompleted(0, "\"1\""));
+            Replay.Result second = replay.advance(history);
+            assertEquals(List.of(new Event.StepScheduled(1, "b")), second.newEvents());
+
+            second.newEvents().forEach(history::add);
+            history.add(new Event.StepCompleted(1, "\"2\""));
+            assertEquals(new Outcome.Completed("\"12\""), replay.advance(history).outcome());
+        }
+        assertEquals(1, entries.get());
+    }
+
+    @Test
+    void closingAParkedExecutionUnwindsTheWorkflowCode() {
+        AtomicBoolean unwound = new AtomicBoolean();
+        var definition = new WorkflowDefinition<>("test", String.class, String.class, (ctx, in) -> {
+            try {
+                return ctx.step("a", String.class, step -> "unused");
+            } finally {
+                unwound.set(true);
+            }
+        });
+
+        Replay replay = new Replay(definition, "wf-1", new JacksonCodec(), Clock.systemUTC());
+        assertInstanceOf(Outcome.Blocked.class, replay.advance(HistoryIndex.of(List.of(STARTED))).outcome());
+        assertFalse(unwound.get());
+
+        replay.close();
+        assertTrue(unwound.get());
     }
 
     @Test

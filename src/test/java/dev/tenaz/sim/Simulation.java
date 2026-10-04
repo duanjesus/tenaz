@@ -173,9 +173,9 @@ final class Simulation {
             String id = "hold-" + i;
             Duration start = randomDuration(CHAOS);
             workflowIds.add(id);
-            world.at(start, () -> client.start("hold", id, id));
             if (world.random.nextInt(3) == 0) {
                 neverApproved.add(id);
+                world.at(start, () -> client.start("hold", id, id));
                 continue;
             }
             // Approvals cluster around the deadline, where the race with the timer is closest.
@@ -183,7 +183,11 @@ final class Simulation {
             if (delay.compareTo(Duration.ofSeconds(1)) < 0) {
                 promptlyApproved.add(id);
             }
-            world.at(start.plus(delay), () -> client.handle(id, String.class).signal("approve", "ok"));
+            // Scheduled by the start itself: a workflow cannot be signalled before it exists.
+            world.at(start, () -> {
+                client.start("hold", id, id);
+                world.at(delay, () -> client.handle(id, String.class).signal("approve", "ok"));
+            });
         }
     }
 

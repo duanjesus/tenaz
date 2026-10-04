@@ -7,7 +7,6 @@ import dev.tenaz.api.RetryPolicy;
 import dev.tenaz.api.StepAction;
 import dev.tenaz.api.StepFailedException;
 import dev.tenaz.api.StepFunction;
-import dev.tenaz.api.Workflow;
 import dev.tenaz.api.WorkflowContext;
 import dev.tenaz.engine.HistoryIndex.Resolution;
 import dev.tenaz.journal.Event;
@@ -20,18 +19,29 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * Runs workflow code against a history and reports how far it got.
+ * One execution of a workflow's code, kept alive for as long as someone drives it.
  *
- * <p>The code runs from the top on the calling thread. Whatever the history already answers is
- * answered from it; the first time the code needs an answer that is not there yet, it is unwound
- * with {@link Suspended}. Nothing is observable about an unresolved promise except by waiting on
- * it, and resolved promises are ordered by their position in the append-only history, so a replay
- * against a longer history always retraces the path of a replay against a shorter one.
+ * <p>The code runs on its own virtual thread. Whatever the history already answers is answered
+ * from it; when the code needs an answer that is not there yet, its thread parks, with the
+ * workflow's stack intact. {@link #advance} hands it a longer history and lets it run until it
+ * parks again or ends. The first advance is therefore a replay of everything recorded so far,
+ * and each later one costs only the new work.
+ *
+ * <p>The two threads never run at the same time: the caller of {@code advance} waits while the
+ * workflow thread runs, and the workflow thread waits otherwise. That keeps the execution as
+ * deterministic as running the code inline would be.
+ *
+ * <p>Nothing is observable about an unresolved promise except by waiting on it, and resolved
+ * promises are ordered by their position in the append-only history. So code that is fed a
+ * history a piece at a time takes the same path as code replayed against the whole of it, which
+ * is what lets another engine rebuild this execution from the journal alone.
  */
-final class Replay {
+final class Replay implements AutoCloseable {
 
     sealed interface Outcome {
         record Completed(String result) implements Outcome {}
@@ -43,88 +53,166 @@ final class Replay {
     }
 
     /**
-     * @param newEvents    commands the code issued that the history does not contain yet
-     * @param pendingSteps every step the code is counting on that has no recorded outcome
+     * @param newEvents    commands the code issued since the last advance that are not in the history
+     * @param pendingSteps steps the code issued since the last advance that have no recorded outcome
      */
     record Result(Outcome outcome, List<Event> newEvents, List<PendingStep> pendingSteps) {}
 
     record PendingStep(int seq, String name, StepFunction<?> body, RetryPolicy retry) {}
 
-    private static final class Suspended extends Error {
-        static final Suspended INSTANCE = new Suspended();
+    /** Unwinds the workflow code when its execution is discarded. */
+    private static final class Abandoned extends Error {
+        static final Abandoned INSTANCE = new Abandoned();
 
-        private Suspended() {
+        private Abandoned() {
             super(null, null, false, false);
         }
     }
 
-    private Replay() {}
+    private final String workflowId;
+    private final PayloadCodec codec;
+    private final Clock clock;
+    private final Context ctx = new Context();
+    private final Semaphore resume = new Semaphore(0);
+    private final Semaphore yielded = new Semaphore(0);
+    private final Thread thread;
+    private boolean started;
+    private volatile boolean closed;
+    // Written by the workflow thread before it yields, read by the driver after.
+    private Outcome outcome;
+    private Throwable crash;
+    private boolean nonDeterministic;
+    private boolean parked;
 
-    static <I, O> Result run(WorkflowDefinition<I, O> definition, String workflowId, List<Event> history,
-                             PayloadCodec codec, Clock clock) {
-        return run(definition, workflowId, HistoryIndex.of(history), codec, clock);
+    Replay(WorkflowDefinition<?, ?> definition, String workflowId, PayloadCodec codec, Clock clock) {
+        this.workflowId = workflowId;
+        this.codec = codec;
+        this.clock = clock;
+        this.thread = Thread.ofVirtual().name("tenaz-workflow-" + workflowId).unstarted(() -> run(definition));
     }
 
-    static <I, O> Result run(WorkflowDefinition<I, O> definition, String workflowId, HistoryIndex history,
-                             PayloadCodec codec, Clock clock) {
-        if (!(history.first() instanceof Event.WorkflowStarted started)) {
+    /** Replays a whole history in one go. */
+    static Result run(WorkflowDefinition<?, ?> definition, String workflowId, List<Event> history,
+                      PayloadCodec codec, Clock clock) {
+        try (Replay replay = new Replay(definition, workflowId, codec, clock)) {
+            return replay.advance(HistoryIndex.of(history));
+        }
+    }
+
+    /**
+     * Runs the code against a history that extends the one it last saw, until it blocks or ends.
+     * Once it has ended, or has been found non-deterministic, it cannot be advanced again.
+     */
+    Result advance(HistoryIndex history) {
+        if (closed || outcome != null && !(outcome instanceof Outcome.Blocked)) {
+            throw new IllegalStateException("workflow execution of " + workflowId + " is over");
+        }
+        if (!(history.first() instanceof Event.WorkflowStarted)) {
             throw new IllegalStateException("history of " + workflowId + " does not begin with WorkflowStarted");
         }
-        Context ctx = new Context(workflowId, history, codec, clock);
-        try {
-            Outcome outcome;
+        ctx.history = history;
+        ctx.newEvents = new ArrayList<>();
+        ctx.pendingSteps = new ArrayList<>();
+        if (!started) {
+            started = true;
+            thread.start();
+        }
+        resume.release();
+        yielded.acquireUninterruptibly();
+        if (crash != null) {
+            throw new IllegalStateException("workflow code of " + workflowId + " died", crash);
+        }
+        if (!nonDeterministic && !(outcome instanceof Outcome.Failed)) {
             try {
-                I input = codec.decode(started.input(), definition.inputType());
-                O output = definition.workflow().run(ctx, input);
-                outcome = new Outcome.Completed(codec.encode(output));
-            } catch (Suspended e) {
-                outcome = new Outcome.Blocked();
-            } catch (Exception e) {
-                return new Result(new Outcome.Failed(e.getClass().getName(), String.valueOf(e.getMessage())),
-                        ctx.newEvents, List.of());
+                ctx.checkHistoryConsumed();
+            } catch (NonDeterminismError e) {
+                diverged(e);
             }
-            ctx.checkHistoryConsumed();
-            return new Result(outcome, ctx.newEvents, ctx.pendingSteps);
-        } catch (NonDeterminismError e) {
-            return new Result(new Outcome.Failed(e.getClass().getName(), e.getMessage()), List.of(), List.of());
+        }
+        if (nonDeterministic) {
+            // Whatever the code asked for after diverging from its history means nothing.
+            return new Result(outcome, List.of(), List.of());
+        }
+        return new Result(outcome, ctx.newEvents, outcome instanceof Outcome.Failed ? List.of() : ctx.pendingSteps);
+    }
+
+    /** Discards the execution, unwinding the workflow code if it is parked. */
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        if (parked) {
+            resume.release();
+            yielded.acquireUninterruptibly();
         }
     }
 
-    private static final class Promise<T> implements DurablePromise<T> {
-        final int resolvedAt;
-        final Supplier<T> value;
+    private <I, O> void run(WorkflowDefinition<I, O> definition) {
+        resume.acquireUninterruptibly();
+        try {
+            Event.WorkflowStarted started = (Event.WorkflowStarted) ctx.history.first();
+            I input = codec.decode(started.input(), definition.inputType());
+            O output = definition.workflow().run(ctx, input);
+            outcome = new Outcome.Completed(codec.encode(output));
+        } catch (Abandoned e) {
+            // closed while parked; nobody wants an outcome
+        } catch (NonDeterminismError e) {
+            diverged(e);
+        } catch (Exception e) {
+            outcome = new Outcome.Failed(e.getClass().getName(), String.valueOf(e.getMessage()));
+        } catch (Throwable e) {
+            crash = e;
+        } finally {
+            yielded.release();
+        }
+    }
 
-        Promise(Resolution resolution, Supplier<T> value) {
-            this.resolvedAt = resolution == null ? -1 : resolution.position();
+    private void diverged(NonDeterminismError e) {
+        nonDeterministic = true;
+        outcome = new Outcome.Failed(e.getClass().getName(), e.getMessage());
+    }
+
+    /** Called on the workflow thread: hands control back until the history has grown. */
+    private void park() {
+        outcome = new Outcome.Blocked();
+        parked = true;
+        yielded.release();
+        resume.acquireUninterruptibly();
+        parked = false;
+        if (closed) {
+            throw Abandoned.INSTANCE;
+        }
+    }
+
+    private final class Promise<T> implements DurablePromise<T> {
+        private final Supplier<Resolution> lookup;
+        private final Function<Resolution, T> value;
+
+        Promise(Supplier<Resolution> lookup, Function<Resolution, T> value) {
+            this.lookup = lookup;
             this.value = value;
         }
 
         @Override
         public T get() {
-            if (resolvedAt < 0) {
-                throw Suspended.INSTANCE;
+            Resolution resolution = lookup.get();
+            while (resolution == null) {
+                park();
+                resolution = lookup.get();
             }
-            return value.get();
+            return value.apply(resolution);
         }
     }
 
-    private static final class Context implements WorkflowContext {
-        private final String workflowId;
-        private final PayloadCodec codec;
-        private final Clock clock;
-        private final HistoryIndex history;
+    private final class Context implements WorkflowContext {
         private final Map<String, Integer> signalCursor = new HashMap<>();
-        final List<Event> newEvents = new ArrayList<>();
-        final List<PendingStep> pendingSteps = new ArrayList<>();
+        HistoryIndex history;
+        List<Event> newEvents;
+        List<PendingStep> pendingSteps;
         private int nextSeq;
         private int uuidCounter;
-
-        Context(String workflowId, HistoryIndex history, PayloadCodec codec, Clock clock) {
-            this.workflowId = workflowId;
-            this.history = history;
-            this.codec = codec;
-            this.clock = clock;
-        }
 
         /** Code that stops short of commands it issued in an earlier run has changed underneath us. */
         void checkHistoryConsumed() {
@@ -132,6 +220,13 @@ final class Replay {
             if (recorded >= nextSeq) {
                 throw new NonDeterminismError("history has command #" + recorded + " (" + history.command(recorded)
                         + ") but the workflow code only issued " + nextSeq + " commands");
+            }
+        }
+
+        /** Code that swallowed {@link Abandoned} must not be able to carry on. */
+        private void checkOpen() {
+            if (closed) {
+                throw Abandoned.INSTANCE;
             }
         }
 
@@ -165,6 +260,7 @@ final class Replay {
 
         @Override
         public <T> DurablePromise<T> stepAsync(String name, Class<T> type, RetryPolicy retry, StepFunction<T> body) {
+            checkOpen();
             int seq = nextSeq++;
             Event recorded = history.command(seq);
             if (recorded == null) {
@@ -172,11 +268,10 @@ final class Replay {
             } else if (!(recorded instanceof Event.StepScheduled scheduled && scheduled.name().equals(name))) {
                 throw mismatch(seq, "step '" + name + "'", recorded);
             }
-            Resolution resolution = history.resolution(seq);
-            if (resolution == null) {
+            if (history.resolution(seq) == null) {
                 pendingSteps.add(new PendingStep(seq, name, body, retry));
             }
-            return new Promise<>(resolution, () -> switch (resolution.event()) {
+            return new Promise<>(() -> history.resolution(seq), resolution -> switch (resolution.event()) {
                 case Event.StepCompleted done -> codec.decode(done.result(), type);
                 case Event.StepFailed failed ->
                         throw new StepFailedException(name, failed.errorType(), failed.message());
@@ -191,6 +286,7 @@ final class Replay {
 
         @Override
         public DurablePromise<Void> timer(Duration duration) {
+            checkOpen();
             int seq = nextSeq++;
             Event recorded = history.command(seq);
             if (recorded == null) {
@@ -198,7 +294,7 @@ final class Replay {
             } else if (!(recorded instanceof Event.TimerStarted)) {
                 throw mismatch(seq, "timer", recorded);
             }
-            return new Promise<>(history.resolution(seq), () -> null);
+            return new Promise<>(() -> history.resolution(seq), resolution -> null);
         }
 
         @Override
@@ -208,29 +304,36 @@ final class Replay {
 
         @Override
         public <T> DurablePromise<T> signal(String name, Class<T> type) {
+            checkOpen();
             int position = signalCursor.merge(name, 1, Integer::sum) - 1;
-            Resolution resolution = history.signal(name, position);
-            return new Promise<>(resolution,
-                    () -> codec.decode(((Event.SignalReceived) resolution.event()).payload(), type));
+            return new Promise<>(() -> history.signal(name, position),
+                    resolution -> codec.decode(((Event.SignalReceived) resolution.event()).payload(), type));
         }
 
         @Override
         public DurablePromise<?> anyOf(DurablePromise<?>... promises) {
-            Promise<?> first = null;
-            for (DurablePromise<?> candidate : promises) {
-                Promise<?> promise = (Promise<?>) candidate;
-                if (promise.resolvedAt >= 0 && (first == null || promise.resolvedAt < first.resolvedAt)) {
-                    first = promise;
+            while (true) {
+                checkOpen();
+                Promise<?> first = null;
+                int firstAt = Integer.MAX_VALUE;
+                for (DurablePromise<?> candidate : promises) {
+                    Promise<?> promise = (Promise<?>) candidate;
+                    Resolution resolution = promise.lookup.get();
+                    if (resolution != null && resolution.position() < firstAt) {
+                        first = promise;
+                        firstAt = resolution.position();
+                    }
                 }
+                if (first != null) {
+                    return first;
+                }
+                park();
             }
-            if (first == null) {
-                throw Suspended.INSTANCE;
-            }
-            return first;
         }
 
         @Override
         public <T> T sideEffect(Class<T> type, Supplier<T> supplier) {
+            checkOpen();
             int seq = nextSeq++;
             Event recorded = history.command(seq);
             String value;
@@ -253,6 +356,7 @@ final class Replay {
 
         @Override
         public UUID randomUUID() {
+            checkOpen();
             String name = workflowId + "/uuid/" + uuidCounter++;
             return UUID.nameUUIDFromBytes(name.getBytes(StandardCharsets.UTF_8));
         }
