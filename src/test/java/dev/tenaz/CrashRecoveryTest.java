@@ -20,7 +20,11 @@ class CrashRecoveryTest {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
-    private final Journal journal = new InMemoryJournal();
+    protected final Journal journal = createJournal();
+
+    protected Journal createJournal() {
+        return new InMemoryJournal();
+    }
 
     private TenazEngine engine(String name, Workflow<String, String> workflow) {
         return TenazEngine.builder(journal)

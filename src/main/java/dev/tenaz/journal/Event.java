@@ -30,8 +30,4 @@ public sealed interface Event {
     record WorkflowCompleted(String result) implements Event {}
 
     record WorkflowFailed(String errorType, String message) implements Event {}
-
-    default boolean isTerminal() {
-        return this instanceof WorkflowCompleted || this instanceof WorkflowFailed;
-    }
 }

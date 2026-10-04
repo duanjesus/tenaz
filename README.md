@@ -58,28 +58,49 @@ mid-replay forces a fresh replay instead of being ordered inconsistently.
 
 ## Evidence
 
-[ChaosTest](src/test/java/dev/tenaz/ChaosTest.java) runs 300 money transfers on a three-node
-cluster while killing a random node 60 times, and asserts that every transfer completes and every
-debit and credit takes effect exactly once. A typical run forces about 40 steps to execute twice;
-the balances still match to the cent.
+The same test suites run against both journals.
+
+- [ChaosTest](src/test/java/dev/tenaz/ChaosTest.java) runs 300 money transfers on a three-node
+  cluster while killing a random node 60 times, and asserts that every transfer completes and every
+  debit and credit takes effect exactly once. A typical run forces 30 to 70 steps to execute twice;
+  the balances still match to the cent.
+- [KillNineTest](src/test/java/dev/tenaz/KillNineTest.java) simulates nothing: the workers are
+  separate JVMs on PostgreSQL, and the operating system destroys one every second or so, with no
+  chance to clean up. Same assertions, same result.
 
 ```
 ./mvnw test
 ```
 
+The PostgreSQL tests start a container and are skipped when Docker is not available.
+
+## Using PostgreSQL
+
+```java
+PostgresJournal journal = new PostgresJournal(dataSource);   // a pooled DataSource
+journal.migrate();                                            // creates the tenaz_* tables
+TenazEngine engine = TenazEngine.builder(journal).build();
+```
+
+Each journal operation is one transaction that locks the workflow's row first, so the lease epoch
+and history version are always checked against committed state. Workers claim work with
+`FOR UPDATE SKIP LOCKED` and are woken by `LISTEN/NOTIFY`, with polling as a fallback. See
+[PostgresJournal.java](src/main/java/dev/tenaz/journal/PostgresJournal.java).
+
 ## Limitations
 
-- The only journal is in-memory: it survives engine crashes, not the JVM. A PostgreSQL journal is
-  the next milestone.
+- The whole history is loaded for every replay, so cost grows with the square of a workflow's
+  length. Fine for tens of steps, not for thousands.
+- Leases are renewed one statement per running workflow.
 - Retry attempts are counted per worker; a takeover restarts the count.
 - Payload types are plain classes (`Class<T>`); generic types such as `List<Foo>` are not supported.
 - No workflow versioning: changing the code of a workflow with executions in flight fails them.
 - `finally` blocks in workflow code run on every replay.
+- No benchmarks yet, so no throughput claims.
 
 ## Roadmap
 
-1. PostgreSQL journal (`SKIP LOCKED` claims, `LISTEN/NOTIFY` wake-ups), crash tests with `kill -9`
-2. Deterministic simulation testing: simulated clock, scheduler and faults under one seed
+1. Deterministic simulation testing: simulated clock, scheduler and faults under one seed
+2. History caching and batched lease renewal, then benchmarks
 3. Child workflows, cancellation, versioning
 4. Spring Boot starter and a history viewer
-5. Benchmarks

@@ -57,7 +57,11 @@ class ChaosTest {
         }
     }
 
-    private final Journal journal = new InMemoryJournal();
+    protected final Journal journal = createJournal();
+
+    protected Journal createJournal() {
+        return new InMemoryJournal();
+    }
     private final Bank bank = new Bank();
     private int started;
 
@@ -128,8 +132,8 @@ class ChaosTest {
         nodes.forEach(TenazEngine::close);
 
         int repeated = bank.executions - 2 * TRANSFERS;
-        System.out.printf("chaos: %d transfers, %d node kills, %d step executions repeated after a kill%n",
-                TRANSFERS, KILLS, repeated);
+        System.out.printf("%s: %d transfers, %d node kills, %d step executions repeated after a kill%n",
+                getClass().getSimpleName(), TRANSFERS, KILLS, repeated);
         assertEquals(ACCOUNTS * OPENING_BALANCE, bank.total(), "money is conserved");
         assertEquals(2 * TRANSFERS, bank.applied.size(), "every debit and credit took effect");
         for (String account : expected.keySet()) {

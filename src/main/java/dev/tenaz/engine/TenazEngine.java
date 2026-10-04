@@ -46,6 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class TenazEngine implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(TenazEngine.class.getName());
+    private static final Duration SESSION_WAIT = Duration.ofSeconds(1);
 
     private final Journal journal;
     private final PayloadCodec codec;
@@ -144,6 +145,11 @@ public final class TenazEngine implements AutoCloseable {
                 Optional<Lease> lease = Optional.empty();
                 try {
                     lease = live().claim(workerId, types, leaseTtl, clock.instant());
+                } catch (RuntimeException e) {
+                    if (stopped) {
+                        return;
+                    }
+                    LOG.log(System.Logger.Level.WARNING, "could not claim work; will retry", e);
                 } finally {
                     if (lease.isEmpty()) {
                         slots.release();
@@ -176,16 +182,24 @@ public final class TenazEngine implements AutoCloseable {
         long nextRenew = System.nanoTime();
         try {
             while (!stopped) {
-                if (live().fireDueTimers(clock.instant()) > 0) {
-                    wakeup.release();
-                }
-                if (System.nanoTime() - nextRenew >= 0) {
-                    for (Session session : sessions) {
-                        if (!live().renew(session.lease, leaseTtl, clock.instant())) {
-                            session.fence();
-                        }
+                try {
+                    if (live().fireDueTimers(clock.instant()) > 0) {
+                        wakeup.release();
                     }
-                    nextRenew = System.nanoTime() + renewEvery.toNanos();
+                    if (System.nanoTime() - nextRenew >= 0) {
+                        for (Session session : sessions) {
+                            if (!live().renew(session.lease, leaseTtl, clock.instant())) {
+                                session.fence();
+                            }
+                        }
+                        nextRenew = System.nanoTime() + renewEvery.toNanos();
+                    }
+                } catch (RuntimeException e) {
+                    // Leases that cannot be renewed simply expire; the fencing epoch keeps that safe.
+                    if (stopped) {
+                        return;
+                    }
+                    LOG.log(System.Logger.Level.WARNING, "housekeeping failed; will retry", e);
                 }
                 Thread.sleep(tick);
             }
@@ -252,7 +266,8 @@ public final class TenazEngine implements AutoCloseable {
                                 }
                                 continue;
                             }
-                            while (!live().awaitChange(id, version, pollInterval)) {
+                            // Stopping and fencing interrupt this wait; the timeout is a safety net.
+                            while (!live().awaitChange(id, version, SESSION_WAIT)) {
                                 if (stopped || session.fenced) {
                                     return;
                                 }
@@ -266,14 +281,24 @@ public final class TenazEngine implements AutoCloseable {
         } catch (InterruptedException | FencedException | EngineDead | RejectedExecutionException e) {
             // lease lost or engine stopping
         } catch (RuntimeException | Error e) {
-            LOG.log(System.Logger.Level.ERROR, "session for workflow " + id + " aborted", e);
+            // An interrupt that lands inside a journal call surfaces as a journal failure.
+            if (!stopped && !session.fenced) {
+                LOG.log(System.Logger.Level.ERROR, "session for workflow " + id + " aborted", e);
+            }
         } finally {
             session.steps.forEach(step -> step.cancel(true));
             sessions.remove(session);
-            if (!released && !crashed) {
-                journal.abandon(lease);
+            try {
+                if (!released && !crashed) {
+                    // Shutdown interrupts this thread, and an interrupted thread cannot do I/O.
+                    Thread.interrupted();
+                    journal.abandon(lease);
+                }
+            } catch (RuntimeException e) {
+                // The lease will expire on its own.
+            } finally {
+                slots.release();
             }
-            slots.release();
         }
     }
 
@@ -291,7 +316,9 @@ public final class TenazEngine implements AutoCloseable {
             // The session is gone. Whoever owns the workflow now will run the step again.
         } catch (RuntimeException | Error e) {
             // The outcome was not journaled, so the session must not park as if it had been.
-            LOG.log(System.Logger.Level.ERROR, "could not journal step '" + step.name() + "'", e);
+            if (!stopped && !session.fenced) {
+                LOG.log(System.Logger.Level.ERROR, "could not journal step '" + step.name() + "'", e);
+            }
             session.fence();
         } finally {
             session.inFlight.decrementAndGet();

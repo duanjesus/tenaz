@@ -11,6 +11,7 @@ import dev.tenaz.api.WorkflowFailedException;
 import dev.tenaz.api.WorkflowHandle;
 import dev.tenaz.engine.TenazEngine;
 import dev.tenaz.journal.InMemoryJournal;
+import dev.tenaz.journal.Journal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
@@ -24,7 +25,13 @@ class WorkflowBasicsTest {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
-    private final TenazEngine engine = TenazEngine.builder(new InMemoryJournal())
+    protected final Journal journal = createJournal();
+
+    protected Journal createJournal() {
+        return new InMemoryJournal();
+    }
+
+    private final TenazEngine engine = TenazEngine.builder(journal)
             .pollInterval(Duration.ofMillis(5))
             .build();
 
