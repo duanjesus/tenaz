@@ -93,6 +93,7 @@ where the live execution saw it.
 | Journaled step | Never executed again |
 | Step in flight during a crash | Executed again: **at-least-once**, with a stable idempotency key to make its effect exactly-once |
 | Timers | Survive restarts; fire once |
+| Signal sent with a key | Seen by the workflow once, however many times it is sent |
 | Starting a workflow | Idempotent on the workflow id, for as long as the workflow is kept |
 | Child outcome | Reaches the parent exactly once, atomically with the end of the child |
 | Starting a child | Only by the parent's current owner; a worker that lost the parent cannot |
@@ -307,8 +308,11 @@ apart, so treat every figure as an order of magnitude.
   them and the engine redoes it from the journal; it costs time, not correctness.
 - `finally` blocks in workflow code also run whenever an engine lets go of the workflow, not only
   when the workflow ends.
-- Signals are not deduplicated: a client that retries a signal after an ambiguous failure may
-  deliver it twice.
+- A signal is deduplicated only if its sender gives it a key
+  (`handle.signal(name, payload, key)`); without one, a sender that retries after an ambiguous
+  failure may deliver it twice.
+- A step has no time limit unless its retry policy sets one (`RetryPolicy.withTimeout`). A timeout
+  interrupts the attempt; it does not undo what the attempt already did.
 - The simulation covers the engine on the in-memory journal. `PostgresJournal` is covered by the
   contract, chaos and kill -9 tests instead.
 

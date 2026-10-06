@@ -195,4 +195,19 @@ class ReplayTest {
 
         assertEquals(new Outcome.Completed("\"cancelled while waiting\""), result.outcome());
     }
+
+    @Test
+    void aRepeatedSignalKeyDoesNotCountAsAnotherSignal() {
+        Workflow<String, String> twoSignals =
+                (ctx, in) -> ctx.awaitSignal("s", String.class) + ctx.awaitSignal("s", String.class);
+
+        Replay.Result waiting = replay(twoSignals, STARTED,
+                new Event.SignalReceived("s", "\"a\"", "k1"), new Event.SignalReceived("s", "\"a\"", "k1"));
+        Replay.Result done = replay(twoSignals, STARTED,
+                new Event.SignalReceived("s", "\"a\"", "k1"), new Event.SignalReceived("s", "\"a\"", "k1"),
+                new Event.SignalReceived("s", "\"b\"", "k2"));
+
+        assertInstanceOf(Outcome.Blocked.class, waiting.outcome());
+        assertEquals(new Outcome.Completed("\"ab\""), done.outcome());
+    }
 }

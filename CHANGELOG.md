@@ -4,6 +4,10 @@
 
 - Retention: `TenazEngine.Builder.retention` and `tenaz.retention` delete a workflow and its
   history a set time after it ends. PostgreSQL gains an `ended_at` column, added by `migrate()`.
+- Idempotent signals: `handle.signal(name, payload, key)`; of the signals sent with one key, a
+  workflow sees only the first.
+- Step timeouts: `RetryPolicy.withTimeout` interrupts an attempt that runs too long and fails it
+  with `StepTimeoutException`, to be retried like any other failure.
 
 ## 0.1.1 (2026-10-06)
 

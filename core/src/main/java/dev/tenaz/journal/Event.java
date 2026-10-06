@@ -42,7 +42,16 @@ public sealed interface Event {
 
     record ChildFailed(int seq, String errorType, String message) implements Event {}
 
-    record SignalReceived(String name, String payload) implements Event {}
+    /**
+     * @param key identifies the signal across retries by its sender, or null. Of several signals
+     *            with the same key, a workflow sees only the first.
+     */
+    record SignalReceived(String name, String payload, String key) implements Event {
+
+        public SignalReceived(String name, String payload) {
+            this(name, payload, null);
+        }
+    }
 
     record CancelRequested(String reason) implements Event {}
 

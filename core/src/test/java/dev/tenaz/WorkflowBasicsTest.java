@@ -280,4 +280,57 @@ class WorkflowBasicsTest {
         assertThrows(WorkflowCancelledException.class, () -> parent.result(TIMEOUT));
         assertThrows(WorkflowCancelledException.class, () -> child.result(TIMEOUT));
     }
+
+    @Test
+    void aSignalSentAgainWithTheSameKeyIsSeenOnce() throws Exception {
+        engine.register("two-votes", String.class, String.class,
+                (ctx, input) -> ctx.awaitSignal("vote", String.class) + "+" + ctx.awaitSignal("vote", String.class))
+                .startWorkers();
+
+        WorkflowHandle<String> handle = engine.start("two-votes", "votes-1", "x");
+        handle.signal("vote", "ana", "ballot-1");
+        handle.signal("vote", "ana", "ballot-1");
+        handle.signal("vote", "bia", "ballot-2");
+
+        assertEquals("ana+bia", handle.result(TIMEOUT));
+    }
+
+    @Test
+    void anAttemptThatRunsPastItsTimeoutIsInterruptedAndRetried() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        AtomicInteger interrupted = new AtomicInteger();
+        RetryPolicy policy = RetryPolicy.fixed(3, Duration.ofMillis(1)).withTimeout(Duration.ofMillis(100));
+        engine.register("slow-then-fast", String.class, String.class,
+                (ctx, input) -> ctx.step("call", String.class, policy, step -> {
+                    if (attempts.incrementAndGet() == 1) {
+                        try {
+                            Thread.sleep(60_000);
+                        } catch (InterruptedException e) {
+                            interrupted.incrementAndGet();
+                            throw e;
+                        }
+                    }
+                    return "answered on attempt " + step.attempt();
+                })).startWorkers();
+
+        assertEquals("answered on attempt 2", engine.<String>start("slow-then-fast", "slow-1", "x").result(TIMEOUT));
+        assertEquals(1, interrupted.get());
+    }
+
+    @Test
+    void aStepThatAlwaysTimesOutFailsWithATimeout() throws Exception {
+        RetryPolicy policy = RetryPolicy.fixed(2, Duration.ofMillis(1)).withTimeout(Duration.ofMillis(50));
+        engine.register("stuck", String.class, String.class, (ctx, input) -> {
+            try {
+                return ctx.step("hang", String.class, policy, step -> {
+                    Thread.sleep(60_000);
+                    return "never";
+                });
+            } catch (StepFailedException e) {
+                return e.errorType();
+            }
+        }).startWorkers();
+
+        assertEquals("dev.tenaz.api.StepTimeoutException", engine.<String>start("stuck", "stuck-1", "x").result(TIMEOUT));
+    }
 }

@@ -22,6 +22,13 @@ public interface WorkflowHandle<O> {
     void signal(String name, Object payload);
 
     /**
+     * Sends a signal that is safe to send again. Of the signals sent with the same key, the
+     * workflow sees only the first, so a sender that got an error and cannot tell whether its
+     * signal arrived may simply repeat the call.
+     */
+    void signal(String name, Object payload, String idempotencyKey);
+
+    /**
      * Asks the workflow to stop. The workflow's code decides what that means: it sees a
      * {@link WorkflowCancelledException} and may clean up before ending.
      */

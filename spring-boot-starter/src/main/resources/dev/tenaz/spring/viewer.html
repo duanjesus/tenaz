@@ -210,7 +210,7 @@
 
   /** Pairs each command with its outcome, so that a step reads as one line with a duration. */
   function timeline(events) {
-    var items = [], open = {};
+    var items = [], open = {}, signalKeys = {};
     events.forEach(function (e) {
       var d = e.data, item;
       switch (e.type) {
@@ -248,7 +248,12 @@
           items.push({ kind: "recorded", title: "Side effect", at: e.at, tone: "COMPLETED", body: pretty(d.value) });
           break;
         case "SignalReceived":
-          items.push({ kind: "signal", title: d.name, at: e.at, tone: "COMPLETED", body: pretty(d.payload) });
+          if (d.key && signalKeys[d.key]) {
+            items.push({ kind: "signal", title: d.name, at: e.at, tone: "CANCELLED", note: "repeat, ignored" });
+          } else {
+            if (d.key) signalKeys[d.key] = true;
+            items.push({ kind: "signal", title: d.name, at: e.at, tone: "COMPLETED", body: pretty(d.payload) });
+          }
           break;
         case "CancelRequested":
           items.push({ kind: "cancel", title: "Cancellation requested", at: e.at, tone: "CANCELLED", body: d.reason });

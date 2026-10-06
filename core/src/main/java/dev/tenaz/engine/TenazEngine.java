@@ -4,6 +4,7 @@ import dev.tenaz.api.JacksonCodec;
 import dev.tenaz.api.NonRetryableException;
 import dev.tenaz.api.PayloadCodec;
 import dev.tenaz.api.StepContext;
+import dev.tenaz.api.StepTimeoutException;
 import dev.tenaz.api.Workflow;
 import dev.tenaz.api.WorkflowCancelledException;
 import dev.tenaz.api.WorkflowFailedException;
@@ -35,6 +36,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -521,30 +523,47 @@ public final class TenazEngine implements AutoCloseable {
 
         private void attempt(PendingStep step, int attempt, Duration backoff) {
             StepContext context = new StepContext(lease.workflowId() + "/" + step.seq(), attempt);
+            // An attempt ends once: with its own outcome, or with the timeout, whichever is first.
+            AtomicBoolean settled = new AtomicBoolean();
             Runnable cancel = runtime.call(() -> step.body().apply(context), (result, error) -> guarded(() -> {
-                if (ended) {
-                    return;
+                if (settled.compareAndSet(false, true)) {
+                    settle(step, attempt, backoff, result, error);
                 }
-                if (error == null) {
-                    arrived.add(encodeResult(step, result));
-                } else if (error instanceof InterruptedException) {
-                    return;
-                } else if (error instanceof NonRetryableException || attempt >= step.retry().maxAttempts()) {
-                    arrived.add(new Event.StepFailed(
-                            step.seq(), error.getClass().getName(), String.valueOf(error.getMessage())));
-                } else {
-                    runtime.schedule(backoff, guarded(() -> {
-                        if (!ended) {
-                            attempt(step, attempt + 1, step.retry().next(backoff));
-                        }
-                    }));
-                    return;
-                }
-                wake();
             }).run());
             synchronized (cancellations) {
                 cancellations.add(cancel);
             }
+            Duration timeout = step.retry().attemptTimeout();
+            if (timeout != null) {
+                runtime.schedule(timeout, guarded(() -> {
+                    if (settled.compareAndSet(false, true)) {
+                        cancel.run();
+                        settle(step, attempt, backoff, null, new StepTimeoutException(step.name(), timeout));
+                    }
+                }));
+            }
+        }
+
+        private void settle(PendingStep step, int attempt, Duration backoff, Object result, Throwable error) {
+            if (ended) {
+                return;
+            }
+            if (error == null) {
+                arrived.add(encodeResult(step, result));
+            } else if (error instanceof InterruptedException) {
+                return;
+            } else if (error instanceof NonRetryableException || attempt >= step.retry().maxAttempts()) {
+                arrived.add(new Event.StepFailed(
+                        step.seq(), error.getClass().getName(), String.valueOf(error.getMessage())));
+            } else {
+                runtime.schedule(backoff, guarded(() -> {
+                    if (!ended) {
+                        attempt(step, attempt + 1, step.retry().next(backoff));
+                    }
+                }));
+                return;
+            }
+            wake();
         }
 
         private Event encodeResult(PendingStep step, Object result) {
@@ -607,6 +626,12 @@ public final class TenazEngine implements AutoCloseable {
         @Override
         public void signal(String name, Object payload) {
             journal.appendExternal(workflowId, new Event.SignalReceived(name, codec.encode(payload)));
+        }
+
+        @Override
+        public void signal(String name, Object payload, String idempotencyKey) {
+            journal.appendExternal(workflowId,
+                    new Event.SignalReceived(name, codec.encode(payload), idempotencyKey));
         }
 
         @Override

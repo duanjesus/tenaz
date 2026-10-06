@@ -3,8 +3,10 @@ package dev.tenaz.engine;
 import dev.tenaz.journal.Event;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * A history, indexed the way a replay consults it. Histories only grow, so the index is built
@@ -25,6 +27,7 @@ final class HistoryIndex {
     private final Map<Integer, Resolution> resolutions = new HashMap<>();
     private final Map<String, List<Resolution>> signals = new HashMap<>();
     private final Map<String, Integer> versions = new HashMap<>();
+    private final Set<String> signalKeys = new HashSet<>();
     private Resolution cancellation;
     private int size;
     private int maxCommandSeq = -1;
@@ -58,7 +61,16 @@ final class HistoryIndex {
             case Event.TimerFired e -> resolutions.put(e.seq(), at);
             case Event.ChildCompleted e -> resolutions.put(e.seq(), at);
             case Event.ChildFailed e -> resolutions.put(e.seq(), at);
-            case Event.SignalReceived e -> signals.computeIfAbsent(e.name(), k -> new ArrayList<>()).add(at);
+            case Event.SignalReceived e -> {
+                // A sender that could not tell whether its signal arrived sends it again; the
+                // repeat is in the history, and no replay ever shows it to the code.
+                if (e.key() == null || !hasSignalKey(e.key())) {
+                    signals.computeIfAbsent(e.name(), k -> new ArrayList<>()).add(at);
+                    if (e.key() != null) {
+                        signalKeys.add(e.key());
+                    }
+                }
+            }
             case Event.VersionMarked e -> versions.putIfAbsent(e.changeId(), e.version());
             case Event.CancelRequested e -> {
                 // Only the first request counts; a workflow is cancelled once.
@@ -114,6 +126,10 @@ final class HistoryIndex {
 
     private int signalCount(String name) {
         return (parent == null ? 0 : parent.signalCount(name)) + signals.getOrDefault(name, List.of()).size();
+    }
+
+    private boolean hasSignalKey(String key) {
+        return signalKeys.contains(key) || parent != null && parent.hasSignalKey(key);
     }
 
     /** The request to cancel the workflow, or null if nobody has asked. */
