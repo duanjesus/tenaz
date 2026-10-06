@@ -16,14 +16,16 @@ import java.util.Map;
  */
 final class HistoryIndex {
 
-    /** @param position where in the history the event sits, which is what orders promises */
+    /** @param position where in the history the event sits, which is what orders everything */
     record Resolution(int position, Event event) {}
 
     private final HistoryIndex parent;
     private final int offset;
-    private final Map<Integer, Event> commands = new HashMap<>();
+    private final Map<Integer, Resolution> commands = new HashMap<>();
     private final Map<Integer, Resolution> resolutions = new HashMap<>();
     private final Map<String, List<Resolution>> signals = new HashMap<>();
+    private final Map<String, Integer> versions = new HashMap<>();
+    private Resolution cancellation;
     private int size;
     private int maxCommandSeq = -1;
     private Event first;
@@ -45,16 +47,25 @@ final class HistoryIndex {
     }
 
     void add(Event event) {
-        int position = offset + size++;
+        Resolution at = new Resolution(offset + size++, event);
         switch (event) {
-            case Event.StepScheduled e -> command(e.seq(), e);
-            case Event.TimerStarted e -> command(e.seq(), e);
-            case Event.SideEffectRecorded e -> command(e.seq(), e);
-            case Event.StepCompleted e -> resolutions.put(e.seq(), new Resolution(position, e));
-            case Event.StepFailed e -> resolutions.put(e.seq(), new Resolution(position, e));
-            case Event.TimerFired e -> resolutions.put(e.seq(), new Resolution(position, e));
-            case Event.SignalReceived e ->
-                    signals.computeIfAbsent(e.name(), k -> new ArrayList<>()).add(new Resolution(position, e));
+            case Event.StepScheduled e -> command(e.seq(), at);
+            case Event.TimerStarted e -> command(e.seq(), at);
+            case Event.SideEffectRecorded e -> command(e.seq(), at);
+            case Event.ChildStarted e -> command(e.seq(), at);
+            case Event.StepCompleted e -> resolutions.put(e.seq(), at);
+            case Event.StepFailed e -> resolutions.put(e.seq(), at);
+            case Event.TimerFired e -> resolutions.put(e.seq(), at);
+            case Event.ChildCompleted e -> resolutions.put(e.seq(), at);
+            case Event.ChildFailed e -> resolutions.put(e.seq(), at);
+            case Event.SignalReceived e -> signals.computeIfAbsent(e.name(), k -> new ArrayList<>()).add(at);
+            case Event.VersionMarked e -> versions.putIfAbsent(e.changeId(), e.version());
+            case Event.CancelRequested e -> {
+                // Only the first request counts; a workflow is cancelled once.
+                if (cancellation() == null) {
+                    cancellation = at;
+                }
+            }
             default -> { }
         }
         if (first == null) {
@@ -63,8 +74,8 @@ final class HistoryIndex {
         last = event;
     }
 
-    private void command(int seq, Event event) {
-        commands.put(seq, event);
+    private void command(int seq, Resolution at) {
+        commands.put(seq, at);
         maxCommandSeq = Math.max(maxCommandSeq, seq);
     }
 
@@ -80,8 +91,9 @@ final class HistoryIndex {
         return last != null || parent == null ? last : parent.last();
     }
 
-    Event command(int seq) {
-        Event command = commands.get(seq);
+    /** The command recorded under this number and where, or null if the code has not issued it. */
+    Resolution command(int seq) {
+        Resolution command = commands.get(seq);
         return command != null || parent == null ? command : parent.command(seq);
     }
 
@@ -102,6 +114,17 @@ final class HistoryIndex {
 
     private int signalCount(String name) {
         return (parent == null ? 0 : parent.signalCount(name)) + signals.getOrDefault(name, List.of()).size();
+    }
+
+    /** The request to cancel the workflow, or null if nobody has asked. */
+    Resolution cancellation() {
+        Resolution inherited = parent == null ? null : parent.cancellation();
+        return inherited != null ? inherited : cancellation;
+    }
+
+    Integer markedVersion(String changeId) {
+        Integer inherited = parent == null ? null : parent.markedVersion(changeId);
+        return inherited != null ? inherited : versions.get(changeId);
     }
 
     int maxCommandSeq() {

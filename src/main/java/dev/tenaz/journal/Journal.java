@@ -19,7 +19,17 @@ public interface Journal {
     /** Creates a workflow. Returns false, changing nothing, if the id already exists. */
     boolean create(String workflowId, Event.WorkflowStarted started);
 
+    /**
+     * Creates a workflow as the child of one the caller owns. Fenced like an append, so that a
+     * worker that lost the parent cannot start children the parent's new owner knows nothing
+     * about. Returns false, changing nothing, if the id already exists.
+     */
+    boolean createChild(Lease parent, String childId, Event.WorkflowStarted started);
+
     Optional<History> load(String workflowId);
+
+    /** The event that started the workflow, without the rest of its history. */
+    Optional<Event.WorkflowStarted> started(String workflowId);
 
     /** The events from position {@code fromVersion} on; empty if there are none yet. */
     List<Event> loadSince(String workflowId, long fromVersion);
@@ -40,7 +50,16 @@ public interface Journal {
      * {@link VersionConflictException} if the history moved since it was read, in which case the
      * caller must read the new events and replay.
      */
-    void append(Lease lease, long expectedVersion, List<Event> events);
+    default void append(Lease lease, long expectedVersion, List<Event> events) {
+        append(lease, expectedVersion, events, List.of());
+    }
+
+    /**
+     * Appends on behalf of the workflow's owner and, in the same atomic operation, delivers
+     * events to other workflows: a child's outcome to its parent, a cancellation to children.
+     * A delivery to a workflow that has ended, or does not exist, is dropped.
+     */
+    void append(Lease lease, long expectedVersion, List<Event> events, List<Delivery> deliveries);
 
     /** Appends an event that comes from outside the workflow, such as a signal. */
     void appendExternal(String workflowId, Event event);
@@ -84,7 +103,20 @@ public interface Journal {
 
     record Lease(String workflowId, String workerId, long epoch) {}
 
-    enum WorkflowStatus { RUNNING, COMPLETED, FAILED }
+    record Delivery(String workflowId, Event event) {}
+
+    enum WorkflowStatus {
+        RUNNING, COMPLETED, FAILED, CANCELLED;
+
+        public static WorkflowStatus after(Event last) {
+            return switch (last) {
+                case Event.WorkflowCompleted ignored -> COMPLETED;
+                case Event.WorkflowFailed ignored -> FAILED;
+                case Event.WorkflowCancelled ignored -> CANCELLED;
+                default -> RUNNING;
+            };
+        }
+    }
 
     /** The lease was taken over by another worker; the holder must stop working on the workflow. */
     final class FencedException extends RuntimeException {

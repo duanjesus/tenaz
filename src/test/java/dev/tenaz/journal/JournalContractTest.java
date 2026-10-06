@@ -111,4 +111,43 @@ abstract class JournalContractTest {
         assertEquals(2, journal.load("wf").orElseThrow().version());
         assertTrue(journal.claim("b", TYPES, TTL, T0.plusSeconds(60), 10).isEmpty());
     }
+
+    @Test
+    void deliveriesLandTogetherWithTheOwnersEvents() {
+        create("parent");
+        Lease parent = claimOne("a", T0);
+        assertTrue(journal.createChild(parent, "child", new Event.WorkflowStarted("t", "null", T0, "parent", 0)));
+        Lease child = claimOne("a", T0);
+
+        journal.append(child, 1, List.of(new Event.WorkflowCompleted("1")),
+                List.of(new Journal.Delivery("parent", new Event.ChildCompleted(0, "1")),
+                        new Journal.Delivery("nobody", new Event.ChildCompleted(0, "1"))));
+
+        assertEquals(Journal.WorkflowStatus.COMPLETED, journal.load("child").orElseThrow().status());
+        assertEquals(List.of(new Event.ChildCompleted(0, "1")), journal.loadSince("parent", 1));
+    }
+
+    @Test
+    void onlyTheOwnerOfTheParentMayCreateItsChildren() {
+        create("parent");
+        Lease zombie = claimOne("a", T0);
+        Lease owner = claimOne("b", T0.plusSeconds(10));
+        Event.WorkflowStarted start = new Event.WorkflowStarted("t", "null", T0, "parent", 3);
+
+        assertThrows(FencedException.class, () -> journal.createChild(zombie, "child", start));
+        assertTrue(journal.createChild(owner, "child", start));
+        assertFalse(journal.createChild(owner, "child", start));
+        assertEquals(start, journal.started("child").orElseThrow());
+        assertTrue(journal.started("nobody").isEmpty());
+    }
+
+    @Test
+    void aCancelledWorkflowIsOver() {
+        create("wf");
+        Lease lease = claimOne("a", T0);
+        journal.append(lease, 1, List.of(new Event.WorkflowCancelled("stop")));
+
+        assertEquals(Journal.WorkflowStatus.CANCELLED, journal.load("wf").orElseThrow().status());
+        assertTrue(journal.claim("b", TYPES, TTL, T0.plusSeconds(60), 10).isEmpty());
+    }
 }

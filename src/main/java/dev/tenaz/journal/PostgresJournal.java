@@ -94,6 +94,26 @@ public final class PostgresJournal implements Journal, AutoCloseable {
             SELECT pg_notify('tenaz_changes', '1 t ' || id) FROM w
             """;
 
+    // FOR SHARE keeps the parent's lease from changing hands while the child is being created.
+    private static final String CREATE_CHILD = """
+            WITH parent AS (
+                SELECT 1 FROM tenaz_workflows
+                 WHERE id = ? AND epoch = ? AND status = 'RUNNING' AND lease_expiry IS NOT NULL
+                   FOR SHARE
+            ), w AS (
+                INSERT INTO tenaz_workflows (id, type, version)
+                SELECT ?, ?, 1 FROM parent
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+            ), e AS (
+                INSERT INTO tenaz_events (workflow_id, seq, type, payload)
+                SELECT id, 0, ?, ?::jsonb FROM w
+            )
+            SELECT (SELECT count(*) FROM parent) AS held,
+                   (SELECT count(*) FROM w) AS created,
+                   (SELECT pg_notify('tenaz_changes', '1 t ' || id) FROM w)
+            """;
+
     private static final String APPEND = """
             WITH w AS (
                 UPDATE tenaz_workflows
@@ -256,6 +276,27 @@ public final class PostgresJournal implements Journal, AutoCloseable {
     }
 
     @Override
+    public boolean createChild(Lease parent, String childId, Event.WorkflowStarted started) {
+        return execute(conn -> {
+            try (PreparedStatement insert = conn.prepareStatement(CREATE_CHILD)) {
+                insert.setString(1, parent.workflowId());
+                insert.setLong(2, parent.epoch());
+                insert.setString(3, childId);
+                insert.setString(4, started.workflowType());
+                insert.setString(5, started.getClass().getSimpleName());
+                insert.setString(6, encode(started));
+                try (ResultSet rows = insert.executeQuery()) {
+                    rows.next();
+                    if (rows.getLong(1) == 0) {
+                        throw new FencedException(parent);
+                    }
+                    return rows.getLong(2) == 1;
+                }
+            }
+        });
+    }
+
+    @Override
     public Optional<History> load(String workflowId) {
         // One statement, therefore one snapshot: status is derived from the events it returns.
         List<Event> events = loadSince(workflowId, 0);
@@ -263,7 +304,22 @@ public final class PostgresJournal implements Journal, AutoCloseable {
             return Optional.empty();
         }
         String type = ((Event.WorkflowStarted) events.get(0)).workflowType();
-        return Optional.of(new History(type, events, statusAfter(events.get(events.size() - 1))));
+        return Optional.of(new History(type, events, WorkflowStatus.after(events.get(events.size() - 1))));
+    }
+
+    @Override
+    public Optional<Event.WorkflowStarted> started(String workflowId) {
+        return execute(conn -> {
+            try (PreparedStatement select = conn.prepareStatement(
+                    "SELECT type, payload FROM tenaz_events WHERE workflow_id = ? AND seq = 0")) {
+                select.setString(1, workflowId);
+                try (ResultSet rows = select.executeQuery()) {
+                    return rows.next()
+                            ? Optional.of((Event.WorkflowStarted) decode(rows.getString(1), rows.getString(2)))
+                            : Optional.<Event.WorkflowStarted>empty();
+                }
+            }
+        });
     }
 
     @Override
@@ -345,8 +401,8 @@ public final class PostgresJournal implements Journal, AutoCloseable {
     }
 
     @Override
-    public void append(Lease lease, long expectedVersion, List<Event> events) {
-        execute(conn -> {
+    public void append(Lease lease, long expectedVersion, List<Event> events, List<Delivery> deliveries) {
+        Work<Void> work = conn -> {
             if (!append(conn, lease.workflowId(), lease, expectedVersion, events)) {
                 State state = state(conn, lease.workflowId());
                 if (state == null || !state.heldBy(lease)) {
@@ -354,8 +410,17 @@ public final class PostgresJournal implements Journal, AutoCloseable {
                 }
                 throw new VersionConflictException(lease.workflowId(), expectedVersion, state.version);
             }
+            for (Delivery delivery : deliveries) {
+                append(conn, delivery.workflowId(), null, 0, List.of(delivery.event()));
+            }
             return null;
-        });
+        };
+        // The common case, an append with nothing to deliver, stays a single statement.
+        if (deliveries.isEmpty()) {
+            execute(work);
+        } else {
+            inTransaction(work);
+        }
     }
 
     @Override
@@ -483,8 +548,8 @@ public final class PostgresJournal implements Journal, AutoCloseable {
                 timerSeqs.add(timer.seq());
                 timerFireAts.add(timer.fireAt().toString());
             }
-            if (statusAfter(event) != WorkflowStatus.RUNNING) {
-                status = statusAfter(event);
+            if (WorkflowStatus.after(event) != WorkflowStatus.RUNNING) {
+                status = WorkflowStatus.after(event);
             }
         }
         try (PreparedStatement statement = conn.prepareStatement(lease != null ? APPEND_OWNED : APPEND_EXTERNAL)) {
@@ -506,14 +571,6 @@ public final class PostgresJournal implements Journal, AutoCloseable {
                 return rows.next();
             }
         }
-    }
-
-    private static WorkflowStatus statusAfter(Event event) {
-        return switch (event) {
-            case Event.WorkflowCompleted ignored -> WorkflowStatus.COMPLETED;
-            case Event.WorkflowFailed ignored -> WorkflowStatus.FAILED;
-            default -> WorkflowStatus.RUNNING;
-        };
     }
 
     private void listen() {

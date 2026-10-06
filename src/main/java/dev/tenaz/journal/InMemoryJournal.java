@@ -60,6 +60,17 @@ public final class InMemoryJournal implements Journal {
     }
 
     @Override
+    public boolean createChild(Lease parent, String childId, Event.WorkflowStarted started) {
+        lock.lock();
+        try {
+            owned(parent);
+            return create(childId, started);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
     public Optional<History> load(String workflowId) {
         lock.lock();
         try {
@@ -68,6 +79,17 @@ public final class InMemoryJournal implements Journal {
                 return Optional.empty();
             }
             return Optional.of(new History(entry.type, List.copyOf(entry.events), entry.status));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public Optional<Event.WorkflowStarted> started(String workflowId) {
+        lock.lock();
+        try {
+            Entry entry = workflows.get(workflowId);
+            return entry == null ? Optional.empty() : Optional.of((Event.WorkflowStarted) entry.events.get(0));
         } finally {
             lock.unlock();
         }
@@ -129,7 +151,7 @@ public final class InMemoryJournal implements Journal {
     }
 
     @Override
-    public void append(Lease lease, long expectedVersion, List<Event> events) {
+    public void append(Lease lease, long expectedVersion, List<Event> events, List<Delivery> deliveries) {
         lock.lock();
         try {
             Entry entry = owned(lease);
@@ -138,6 +160,12 @@ public final class InMemoryJournal implements Journal {
             }
             for (Event event : events) {
                 append(lease.workflowId(), entry, event);
+            }
+            for (Delivery delivery : deliveries) {
+                Entry target = workflows.get(delivery.workflowId());
+                if (target != null && target.status == WorkflowStatus.RUNNING) {
+                    append(delivery.workflowId(), target, delivery.event());
+                }
             }
         } finally {
             lock.unlock();
@@ -267,9 +295,11 @@ public final class InMemoryJournal implements Journal {
                 entry.pendingTimers.put(timer.seq(), timer.fireAt());
                 withTimers.add(workflowId);
             }
-            case Event.WorkflowCompleted ignored -> finish(workflowId, entry, WorkflowStatus.COMPLETED);
-            case Event.WorkflowFailed ignored -> finish(workflowId, entry, WorkflowStatus.FAILED);
-            default -> { }
+            default -> {
+                if (event.endsWorkflow()) {
+                    finish(workflowId, entry, WorkflowStatus.after(event));
+                }
+            }
         }
         if (entry.pendingTimers.isEmpty()) {
             withTimers.remove(workflowId);

@@ -5,12 +5,16 @@ import dev.tenaz.api.NonRetryableException;
 import dev.tenaz.api.PayloadCodec;
 import dev.tenaz.api.StepContext;
 import dev.tenaz.api.Workflow;
+import dev.tenaz.api.WorkflowCancelledException;
 import dev.tenaz.api.WorkflowFailedException;
 import dev.tenaz.api.WorkflowHandle;
+import dev.tenaz.engine.Replay.ChildCancellation;
 import dev.tenaz.engine.Replay.Outcome;
+import dev.tenaz.engine.Replay.PendingChild;
 import dev.tenaz.engine.Replay.PendingStep;
 import dev.tenaz.journal.Event;
 import dev.tenaz.journal.Journal;
+import dev.tenaz.journal.Journal.Delivery;
 import dev.tenaz.journal.Journal.FencedException;
 import dev.tenaz.journal.Journal.History;
 import dev.tenaz.journal.Journal.Lease;
@@ -48,6 +52,7 @@ public final class TenazEngine implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(TenazEngine.class.getName());
     private static final int CLAIM_BATCH = 64;
+    private static final String WORKFLOW_ID_IN_USE = "dev.tenaz.WorkflowIdInUse";
     private static final Comparator<Lease> BY_WORKFLOW =
             Comparator.comparing(Lease::workflowId).thenComparingLong(Lease::epoch);
 
@@ -251,6 +256,7 @@ public final class TenazEngine implements AutoCloseable {
         final Lease lease;
         final HistoryIndex history = new HistoryIndex();
         final Set<Integer> launched = new HashSet<>();
+        final Set<Integer> startedChildren = new HashSet<>();
         final List<Runnable> cancellations = new ArrayList<>();
         final Queue<Event> arrived = new ConcurrentLinkedQueue<>();
         final List<Event> unjournaled = new ArrayList<>();
@@ -330,8 +336,7 @@ public final class TenazEngine implements AutoCloseable {
                     behind = false;
                     live().loadSince(id, history.version()).forEach(history::add);
                     knownVersion = history.version();
-                    if (history.last() instanceof Event.WorkflowCompleted
-                            || history.last() instanceof Event.WorkflowFailed) {
+                    if (history.last() != null && history.last().endsWorkflow()) {
                         end(true);
                         return;
                     }
@@ -353,39 +358,61 @@ public final class TenazEngine implements AutoCloseable {
                 Replay.Result replay = execution.advance(view);
                 List<Event> events = new ArrayList<>(unjournaled);
                 events.addAll(replay.newEvents());
-                switch (replay.outcome()) {
-                    case Outcome.Completed completed -> {
-                        events.add(new Event.WorkflowCompleted(completed.result()));
-                        append(events);
-                        end(true);
+                List<Delivery> deliveries = new ArrayList<>();
+                for (ChildCancellation child : replay.childrenToCancel()) {
+                    deliveries.add(new Delivery(child.childId(), new Event.CancelRequested(child.reason())));
+                }
+                Event ending = switch (replay.outcome()) {
+                    case Outcome.Completed completed -> new Event.WorkflowCompleted(completed.result());
+                    case Outcome.Failed failed -> new Event.WorkflowFailed(failed.errorType(), failed.message());
+                    case Outcome.Cancelled cancelled -> new Event.WorkflowCancelled(cancelled.reason());
+                    case Outcome.Blocked blocked -> null;
+                };
+                if (ending != null) {
+                    events.add(ending);
+                    if (started.parentId() != null) {
+                        // In the same atomic append, so a parent cannot miss its child's outcome.
+                        deliveries.add(new Delivery(started.parentId(), outcomeForParent(started.parentSeq(), ending)));
                     }
-                    case Outcome.Failed failed -> {
-                        events.add(new Event.WorkflowFailed(failed.errorType(), failed.message()));
-                        append(events);
-                        end(true);
+                    append(events, deliveries);
+                    end(true);
+                    return;
+                }
+                // A child can only be cancelled if it exists. The ones being cancelled were
+                // recorded before the cancellation, so creating them now cannot be premature.
+                for (PendingChild child : replay.pendingChildren()) {
+                    if (history.command(child.seq()) != null) {
+                        startChild(child);
                     }
-                    case Outcome.Blocked blocked -> {
-                        if (!events.isEmpty()) {
-                            append(events);
-                            events.forEach(history::add);
-                            outstanding -= unjournaled.size();
-                            unjournaled.clear();
+                }
+                if (!events.isEmpty()) {
+                    append(events, deliveries);
+                    events.forEach(history::add);
+                    for (Event outcome : unjournaled) {
+                        if (outcome instanceof Event.StepCompleted || outcome instanceof Event.StepFailed) {
+                            outstanding--;
                         }
-                        // Steps start only after their StepScheduled is durable.
-                        for (PendingStep step : replay.pendingSteps()) {
-                            if (launched.add(step.seq())) {
-                                outstanding++;
-                                attempt(step, 1, step.retry().initialBackoff());
-                            }
-                        }
-                        if (outstanding == 0) {
-                            if (live().park(lease, history.version())) {
-                                end(true);
-                            } else {
-                                behind = true;
-                                wake();
-                            }
-                        }
+                    }
+                    unjournaled.clear();
+                } else {
+                    for (Delivery delivery : deliveries) {
+                        live().appendExternal(delivery.workflowId(), delivery.event());
+                    }
+                }
+                // Steps and children start only after the command that asks for them is durable.
+                for (PendingStep step : replay.pendingSteps()) {
+                    if (launched.add(step.seq())) {
+                        outstanding++;
+                        attempt(step, 1, step.retry().initialBackoff());
+                    }
+                }
+                replay.pendingChildren().forEach(this::startChild);
+                if (outstanding == 0 && arrived.isEmpty()) {
+                    if (live().park(lease, history.version())) {
+                        end(true);
+                    } else {
+                        behind = true;
+                        wake();
                     }
                 }
             } catch (VersionConflictException e) {
@@ -408,10 +435,46 @@ public final class TenazEngine implements AutoCloseable {
             }
         }
 
-        private void append(List<Event> events) {
+        private void append(List<Event> events, List<Delivery> deliveries) {
             // Set first, so that the notification of our own append does not look like news.
             knownVersion = history.version() + events.size();
-            live().append(lease, history.version(), events);
+            live().append(lease, history.version(), events, deliveries);
+        }
+
+        private Event outcomeForParent(int seq, Event ending) {
+            return switch (ending) {
+                case Event.WorkflowCompleted completed -> new Event.ChildCompleted(seq, completed.result());
+                case Event.WorkflowFailed failed -> new Event.ChildFailed(seq, failed.errorType(), failed.message());
+                case Event.WorkflowCancelled cancelled -> new Event.ChildFailed(
+                        seq, WorkflowCancelledException.class.getName(), cancelled.reason());
+                default -> throw new IllegalArgumentException("not an ending: " + ending);
+            };
+        }
+
+        /**
+         * Creates the child workflow. Creation is idempotent, so a session that takes the parent
+         * over simply asks again; what it must check then is that the workflow under that id
+         * really is this parent's child, or the parent would wait for a stranger.
+         */
+        private void startChild(PendingChild child) {
+            if (!startedChildren.add(child.seq())) {
+                return;
+            }
+            String parentId = lease.workflowId();
+            Event.WorkflowStarted start = new Event.WorkflowStarted(child.workflowType(), child.input(),
+                    runtime.clock().instant(), parentId, child.seq());
+            if (live().createChild(lease, child.childId(), start)) {
+                return;
+            }
+            boolean ours = live().started(child.childId())
+                    .map(existing -> parentId.equals(existing.parentId())
+                            && Integer.valueOf(child.seq()).equals(existing.parentSeq()))
+                    .orElse(false);
+            if (!ours) {
+                arrived.add(new Event.ChildFailed(child.seq(), WORKFLOW_ID_IN_USE,
+                        "a workflow with id '" + child.childId() + "' already exists"));
+                wake();
+            }
         }
 
         /** @param released whether the journal already knows this engine no longer owns the workflow */
@@ -503,6 +566,9 @@ public final class TenazEngine implements AutoCloseable {
                 if (last instanceof Event.WorkflowFailed failed) {
                     throw new WorkflowFailedException(workflowId, failed.errorType(), failed.message());
                 }
+                if (last instanceof Event.WorkflowCancelled cancelled) {
+                    throw new WorkflowCancelledException(cancelled.reason());
+                }
                 long remaining = deadline - System.nanoTime();
                 if (remaining <= 0) {
                     throw new TimeoutException("workflow " + workflowId + " still running after " + timeout);
@@ -519,6 +585,11 @@ public final class TenazEngine implements AutoCloseable {
         @Override
         public void signal(String name, Object payload) {
             journal.appendExternal(workflowId, new Event.SignalReceived(name, codec.encode(payload)));
+        }
+
+        @Override
+        public void cancel(String reason) {
+            journal.appendExternal(workflowId, new Event.CancelRequested(reason));
         }
 
         private History history() {

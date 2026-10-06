@@ -30,6 +30,33 @@ public interface WorkflowContext {
 
     <T> DurablePromise<T> stepAsync(String name, Class<T> type, RetryPolicy retry, StepFunction<T> body);
 
+    /**
+     * Starts another workflow as a child and returns its result. The child is an ordinary
+     * workflow with its own history; the parent holds nothing while it waits. Cancelling the
+     * parent cancels the children it is still waiting for.
+     *
+     * @throws ChildWorkflowFailedException if the child fails, is cancelled, or the id is taken
+     *                                      by a workflow that is not this parent's child
+     */
+    <T> T child(String workflowType, String childId, Object input, Class<T> type);
+
+    /** Starts a child without waiting for it, so that several can run at once. */
+    <T> DurablePromise<T> childAsync(String workflowType, String childId, Object input, Class<T> type);
+
+    /**
+     * Lets workflow code change while executions of the old code are still in flight. Wrap the
+     * change in a check of the returned version: an execution that already ran through this
+     * point before the change existed gets 0 and must follow the original path; any other gets
+     * {@code maxSupported}, recorded so that it gets the same answer on every replay.
+     *
+     * <pre>{@code
+     * if (ctx.version("add-fraud-check", 1) >= 1) {
+     *     ctx.run("fraud-check", step -> fraud.check(order));
+     * }
+     * }</pre>
+     */
+    int version(String changeId, int maxSupported);
+
     /** Durable sleep: holds no thread, and survives restarts however long the duration is. */
     void sleep(Duration duration);
 

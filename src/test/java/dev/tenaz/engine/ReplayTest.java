@@ -9,6 +9,7 @@ import dev.tenaz.api.DurablePromise;
 import dev.tenaz.api.JacksonCodec;
 import dev.tenaz.api.NonDeterminismError;
 import dev.tenaz.api.Workflow;
+import dev.tenaz.api.WorkflowCancelledException;
 import dev.tenaz.engine.Replay.Outcome;
 import dev.tenaz.journal.Event;
 import java.time.Clock;
@@ -131,5 +132,67 @@ class ReplayTest {
 
         assertEquals(new Outcome.Completed("\"timer\""), timerFirst.outcome());
         assertEquals(new Outcome.Completed("\"step\""), stepFirst.outcome());
+    }
+
+    private static final Workflow<String, String> VERSIONED = (ctx, in) -> {
+        String before = ctx.step("before", String.class, step -> "unused");
+        return before + ctx.step("v" + ctx.version("change", 2), String.class, step -> "unused");
+    };
+
+    @Test
+    void aNewExecutionRunsTheLatestVersionAndRecordsIt() {
+        Replay.Result result = replay(VERSIONED, STARTED,
+                new Event.StepScheduled(0, "before"), new Event.StepCompleted(0, "\"a\""));
+
+        assertEquals(List.of(new Event.VersionMarked("change", 2), new Event.StepScheduled(1, "v2")),
+                result.newEvents());
+    }
+
+    @Test
+    void anExecutionKeepsTheVersionItRecorded() {
+        Replay.Result result = replay(VERSIONED, STARTED,
+                new Event.StepScheduled(0, "before"), new Event.StepCompleted(0, "\"a\""),
+                new Event.VersionMarked("change", 1),
+                new Event.StepScheduled(1, "v1"), new Event.StepCompleted(1, "\"b\""));
+
+        assertEquals(new Outcome.Completed("\"ab\""), result.outcome());
+    }
+
+    @Test
+    void anExecutionFromBeforeTheChangeKeepsToTheOriginalPath() {
+        Replay.Result result = replay(VERSIONED, STARTED,
+                new Event.StepScheduled(0, "before"), new Event.StepCompleted(0, "\"a\""),
+                new Event.StepScheduled(1, "v0"), new Event.StepCompleted(1, "\"b\""));
+
+        assertEquals(new Outcome.Completed("\"ab\""), result.outcome());
+        assertTrue(result.newEvents().isEmpty());
+    }
+
+    @Test
+    void cancellationDoesNotUndoWhatWasRecordedBeforeItAndStopsWhatComesAfter() {
+        Replay.Result result = replay(
+                (ctx, in) -> ctx.step("a", String.class, step -> "unused")
+                        + ctx.step("b", String.class, step -> "unused"),
+                STARTED, new Event.StepScheduled(0, "a"), new Event.StepCompleted(0, "\"a\""),
+                new Event.CancelRequested("stop"));
+
+        assertEquals(new Outcome.Cancelled("stop"), result.outcome());
+        assertTrue(result.newEvents().isEmpty(), "step b must not be scheduled");
+    }
+
+    @Test
+    void cancellationInterruptsAWaitForSomethingThatHadNotHappenedYet() {
+        Replay.Result result = replay(
+                (ctx, in) -> {
+                    try {
+                        return ctx.step("a", String.class, step -> "unused");
+                    } catch (WorkflowCancelledException e) {
+                        return "cancelled while waiting";
+                    }
+                },
+                STARTED, new Event.StepScheduled(0, "a"), new Event.CancelRequested("stop"),
+                new Event.StepCompleted(0, "\"late\""));
+
+        assertEquals(new Outcome.Completed("\"cancelled while waiting\""), result.outcome());
     }
 }

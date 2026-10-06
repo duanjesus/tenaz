@@ -5,8 +5,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.tenaz.api.DurablePromise;
+import dev.tenaz.api.ChildWorkflowFailedException;
 import dev.tenaz.api.RetryPolicy;
 import dev.tenaz.api.StepFailedException;
+import dev.tenaz.api.WorkflowCancelledException;
 import dev.tenaz.api.WorkflowFailedException;
 import dev.tenaz.api.WorkflowHandle;
 import dev.tenaz.engine.TenazEngine;
@@ -182,5 +184,100 @@ class WorkflowBasicsTest {
         WorkflowHandle<String> handle = engine.start("broken", "broken-1", "x");
         WorkflowFailedException failure = assertThrows(WorkflowFailedException.class, () -> handle.result(TIMEOUT));
         assertEquals("java.lang.IllegalArgumentException", failure.errorType());
+    }
+
+    @Test
+    void childWorkflowsReturnTheirResultsToTheParent() throws Exception {
+        engine.register("double", Integer.class, Integer.class,
+                        (ctx, n) -> ctx.step("double", Integer.class, step -> n * 2))
+                .register("sum-of-doubles", Integer.class, Integer.class, (ctx, n) -> {
+                    DurablePromise<Integer> a = ctx.childAsync("double", ctx.workflowId() + "/a", n, Integer.class);
+                    DurablePromise<Integer> b = ctx.childAsync("double", ctx.workflowId() + "/b", n + 1, Integer.class);
+                    return a.get() + b.get();
+                })
+                .startWorkers();
+
+        assertEquals(22, engine.<Integer>start("sum-of-doubles", "parent-1", 5).result(TIMEOUT));
+        assertEquals(10, engine.handle("parent-1/a", Integer.class).result(TIMEOUT));
+    }
+
+    @Test
+    void childFailureReachesTheParentAsAnException() throws Exception {
+        engine.register("doomed", String.class, String.class, (ctx, input) -> {
+                    throw new IllegalStateException("no luck");
+                })
+                .register("parent", String.class, String.class, (ctx, input) -> {
+                    try {
+                        return ctx.child("doomed", "doomed-1", input, String.class);
+                    } catch (ChildWorkflowFailedException e) {
+                        return "child failed: " + e.errorType();
+                    }
+                })
+                .startWorkers();
+
+        assertEquals("child failed: java.lang.IllegalStateException",
+                engine.<String>start("parent", "parent-2", "x").result(TIMEOUT));
+    }
+
+    @Test
+    void childIdTakenByAnotherWorkflowFailsTheChildCall() throws Exception {
+        engine.register("sleeper", String.class, String.class, (ctx, input) -> {
+                    ctx.sleep(Duration.ofHours(1));
+                    return "woke";
+                })
+                .register("parent", String.class, String.class, (ctx, input) -> {
+                    try {
+                        return ctx.child("sleeper", "taken", input, String.class);
+                    } catch (ChildWorkflowFailedException e) {
+                        return e.errorType();
+                    }
+                })
+                .startWorkers();
+        engine.start("sleeper", "taken", "x");
+
+        assertEquals("dev.tenaz.WorkflowIdInUse", engine.<String>start("parent", "parent-3", "x").result(TIMEOUT));
+    }
+
+    @Test
+    void cancellingAWorkflowLetsItUndoWhatItDid() throws Exception {
+        AtomicInteger refunds = new AtomicInteger();
+        engine.register("order", String.class, String.class, (ctx, input) -> {
+            ctx.run("charge", step -> { });
+            try {
+                ctx.sleep(Duration.ofHours(1));
+                return "delivered";
+            } catch (WorkflowCancelledException e) {
+                ctx.run("refund", step -> refunds.incrementAndGet());
+                throw e;
+            }
+        }).startWorkers();
+
+        WorkflowHandle<String> handle = engine.start("order", "order-cancelled", "x");
+        Thread.sleep(100);
+        handle.cancel("customer changed their mind");
+
+        WorkflowCancelledException cancelled =
+                assertThrows(WorkflowCancelledException.class, () -> handle.result(TIMEOUT));
+        assertEquals("customer changed their mind", cancelled.reason());
+        assertEquals(1, refunds.get());
+    }
+
+    @Test
+    void cancellingAParentCancelsTheChildrenItIsWaitingFor() throws Exception {
+        engine.register("sleeper", String.class, String.class, (ctx, input) -> {
+                    ctx.sleep(Duration.ofHours(1));
+                    return "woke";
+                })
+                .register("parent", String.class, String.class,
+                        (ctx, input) -> ctx.child("sleeper", "sleeping-child", input, String.class))
+                .startWorkers();
+
+        WorkflowHandle<String> parent = engine.start("parent", "parent-4", "x");
+        WorkflowHandle<String> child = engine.handle("sleeping-child", String.class);
+        Thread.sleep(200);
+        parent.cancel("stop");
+
+        assertThrows(WorkflowCancelledException.class, () -> parent.result(TIMEOUT));
+        assertThrows(WorkflowCancelledException.class, () -> child.result(TIMEOUT));
     }
 }

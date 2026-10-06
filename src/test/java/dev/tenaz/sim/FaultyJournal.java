@@ -94,6 +94,11 @@ final class FaultyJournal implements Journal {
     }
 
     @Override
+    public boolean createChild(Lease parent, String childId, Event.WorkflowStarted started) {
+        return attempt(() -> delegate.createChild(parent, childId, started));
+    }
+
+    @Override
     public Optional<History> load(String workflowId) {
         return attempt(() -> delegate.load(workflowId));
     }
@@ -114,10 +119,15 @@ final class FaultyJournal implements Journal {
     }
 
     @Override
-    public void append(Lease lease, long expectedVersion, List<Event> events) {
+    public Optional<Event.WorkflowStarted> started(String workflowId) {
+        return attempt(() -> delegate.started(workflowId));
+    }
+
+    @Override
+    public void append(Lease lease, long expectedVersion, List<Event> events, List<Delivery> deliveries) {
         attempt(() -> {
             try {
-                delegate.append(lease, expectedVersion, events);
+                delegate.append(lease, expectedVersion, events, deliveries);
             } catch (FencedException e) {
                 if (faults.fencing) {
                     throw e;

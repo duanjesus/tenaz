@@ -1,5 +1,6 @@
 package dev.tenaz.engine;
 
+import dev.tenaz.api.ChildWorkflowFailedException;
 import dev.tenaz.api.DurablePromise;
 import dev.tenaz.api.NonDeterminismError;
 import dev.tenaz.api.PayloadCodec;
@@ -7,6 +8,7 @@ import dev.tenaz.api.RetryPolicy;
 import dev.tenaz.api.StepAction;
 import dev.tenaz.api.StepFailedException;
 import dev.tenaz.api.StepFunction;
+import dev.tenaz.api.WorkflowCancelledException;
 import dev.tenaz.api.WorkflowContext;
 import dev.tenaz.engine.HistoryIndex.Resolution;
 import dev.tenaz.journal.Event;
@@ -16,6 +18,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -36,10 +39,11 @@ import java.util.function.Supplier;
  * workflow thread runs, and the workflow thread waits otherwise. That keeps the execution as
  * deterministic as running the code inline would be.
  *
- * <p>Nothing is observable about an unresolved promise except by waiting on it, and resolved
- * promises are ordered by their position in the append-only history. So code that is fed a
- * history a piece at a time takes the same path as code replayed against the whole of it, which
- * is what lets another engine rebuild this execution from the journal alone.
+ * <p>Nothing is observable about an unresolved promise except by waiting on it, and everything
+ * the code can observe is ordered by position in the append-only history: which of two promises
+ * resolved first, and whether a cancellation came before or after a result. So code that is fed
+ * a history a piece at a time takes the same path as code replayed against the whole of it,
+ * which is what lets another engine rebuild this execution from the journal alone.
  */
 final class Replay implements AutoCloseable {
 
@@ -48,17 +52,29 @@ final class Replay implements AutoCloseable {
 
         record Failed(String errorType, String message) implements Outcome {}
 
-        /** The code is waiting on steps, timers or signals. */
+        /** The code let a cancellation propagate out of the workflow. */
+        record Cancelled(String reason) implements Outcome {}
+
+        /** The code is waiting on steps, timers, signals or children. */
         record Blocked() implements Outcome {}
     }
 
     /**
-     * @param newEvents    commands the code issued since the last advance that are not in the history
-     * @param pendingSteps steps the code issued since the last advance that have no recorded outcome
+     * What the code did since the last advance.
+     *
+     * @param newEvents         commands it issued that are not in the history
+     * @param pendingSteps      steps it issued that have no recorded outcome
+     * @param pendingChildren   children it started that have no recorded outcome
+     * @param childrenToCancel  children still running when a cancellation reached the code
      */
-    record Result(Outcome outcome, List<Event> newEvents, List<PendingStep> pendingSteps) {}
+    record Result(Outcome outcome, List<Event> newEvents, List<PendingStep> pendingSteps,
+                  List<PendingChild> pendingChildren, List<ChildCancellation> childrenToCancel) {}
 
     record PendingStep(int seq, String name, StepFunction<?> body, RetryPolicy retry) {}
+
+    record PendingChild(int seq, String workflowType, String childId, String input) {}
+
+    record ChildCancellation(String childId, String reason) {}
 
     /** Unwinds the workflow code when its execution is discarded. */
     private static final class Abandoned extends Error {
@@ -113,6 +129,8 @@ final class Replay implements AutoCloseable {
         ctx.history = history;
         ctx.newEvents = new ArrayList<>();
         ctx.pendingSteps = new ArrayList<>();
+        ctx.pendingChildren = new ArrayList<>();
+        ctx.childrenToCancel = new ArrayList<>();
         if (!started) {
             started = true;
             thread.start();
@@ -131,9 +149,14 @@ final class Replay implements AutoCloseable {
         }
         if (nonDeterministic) {
             // Whatever the code asked for after diverging from its history means nothing.
-            return new Result(outcome, List.of(), List.of());
+            return new Result(outcome, List.of(), List.of(), List.of(), List.of());
         }
-        return new Result(outcome, ctx.newEvents, outcome instanceof Outcome.Failed ? List.of() : ctx.pendingSteps);
+        if (outcome instanceof Outcome.Blocked) {
+            return new Result(outcome, ctx.newEvents, ctx.pendingSteps, ctx.pendingChildren, ctx.childrenToCancel);
+        }
+        // The workflow is over: nothing it left unfinished will be started, but children it
+        // was asked to cancel still are.
+        return new Result(outcome, ctx.newEvents, List.of(), List.of(), ctx.childrenToCancel);
     }
 
     /** Discards the execution, unwinding the workflow code if it is parked. */
@@ -160,6 +183,8 @@ final class Replay implements AutoCloseable {
             // closed while parked; nobody wants an outcome
         } catch (NonDeterminismError e) {
             diverged(e);
+        } catch (WorkflowCancelledException e) {
+            outcome = new Outcome.Cancelled(e.reason());
         } catch (Exception e) {
             outcome = new Outcome.Failed(e.getClass().getName(), String.valueOf(e.getMessage()));
         } catch (Throwable e) {
@@ -197,29 +222,38 @@ final class Replay implements AutoCloseable {
 
         @Override
         public T get() {
-            Resolution resolution = lookup.get();
-            while (resolution == null) {
+            while (true) {
+                Resolution resolution = lookup.get();
+                // A result recorded before the cancellation is still a result.
+                ctx.throwIfCancelledBefore(resolution);
+                if (resolution != null) {
+                    return value.apply(resolution);
+                }
                 park();
-                resolution = lookup.get();
             }
-            return value.apply(resolution);
         }
     }
 
     private final class Context implements WorkflowContext {
         private final Map<String, Integer> signalCursor = new HashMap<>();
+        private final Map<String, Integer> versionAnswers = new HashMap<>();
+        private final Map<Integer, String> children = new LinkedHashMap<>();
         HistoryIndex history;
         List<Event> newEvents;
         List<PendingStep> pendingSteps;
+        List<PendingChild> pendingChildren;
+        List<ChildCancellation> childrenToCancel;
         private int nextSeq;
         private int uuidCounter;
+        private boolean cancelDelivered;
 
         /** Code that stops short of commands it issued in an earlier run has changed underneath us. */
         void checkHistoryConsumed() {
             int recorded = history.maxCommandSeq();
             if (recorded >= nextSeq) {
-                throw new NonDeterminismError("history has command #" + recorded + " (" + history.command(recorded)
-                        + ") but the workflow code only issued " + nextSeq + " commands");
+                throw new NonDeterminismError("history has command #" + recorded + " ("
+                        + history.command(recorded).event() + ") but the workflow code only issued "
+                        + nextSeq + " commands");
             }
         }
 
@@ -228,6 +262,41 @@ final class Replay implements AutoCloseable {
             if (closed) {
                 throw Abandoned.INSTANCE;
             }
+        }
+
+        /**
+         * A cancellation reaches the code exactly once, as an exception, at the first point
+         * where the code waits for something that had not happened when it was requested.
+         */
+        void throwIfCancelledBefore(Resolution awaited) {
+            Resolution cancellation = cancelDelivered ? null : history.cancellation();
+            if (cancellation == null || awaited != null && awaited.position() < cancellation.position()) {
+                return;
+            }
+            cancelDelivered = true;
+            String reason = ((Event.CancelRequested) cancellation.event()).reason();
+            children.forEach((seq, childId) -> {
+                if (history.resolution(seq) == null) {
+                    childrenToCancel.add(new ChildCancellation(childId, reason));
+                }
+            });
+            throw new WorkflowCancelledException(reason);
+        }
+
+        /**
+         * Reserves the number for a command the code is about to issue. A cancelled workflow
+         * does not get to start anything new until its code has seen the cancellation, so a
+         * command that was not already recorded before the request is refused.
+         */
+        private int nextCommand() {
+            checkOpen();
+            throwIfCancelledBefore(history.command(nextSeq));
+            return nextSeq++;
+        }
+
+        private Event recorded(int seq) {
+            Resolution command = history.command(seq);
+            return command == null ? null : command.event();
         }
 
         @Override
@@ -260,9 +329,8 @@ final class Replay implements AutoCloseable {
 
         @Override
         public <T> DurablePromise<T> stepAsync(String name, Class<T> type, RetryPolicy retry, StepFunction<T> body) {
-            checkOpen();
-            int seq = nextSeq++;
-            Event recorded = history.command(seq);
+            int seq = nextCommand();
+            Event recorded = recorded(seq);
             if (recorded == null) {
                 newEvents.add(new Event.StepScheduled(seq, name));
             } else if (!(recorded instanceof Event.StepScheduled scheduled && scheduled.name().equals(name))) {
@@ -280,15 +348,45 @@ final class Replay implements AutoCloseable {
         }
 
         @Override
+        public <T> T child(String workflowType, String childId, Object input, Class<T> type) {
+            return childAsync(workflowType, childId, input, type).get();
+        }
+
+        @Override
+        public <T> DurablePromise<T> childAsync(String workflowType, String childId, Object input, Class<T> type) {
+            int seq = nextCommand();
+            Event recorded = recorded(seq);
+            String encoded;
+            if (recorded == null) {
+                encoded = codec.encode(input);
+                newEvents.add(new Event.ChildStarted(seq, workflowType, childId, encoded));
+            } else if (recorded instanceof Event.ChildStarted child
+                    && child.workflowType().equals(workflowType) && child.childId().equals(childId)) {
+                encoded = child.input();
+            } else {
+                throw mismatch(seq, "child '" + childId + "' of type '" + workflowType + "'", recorded);
+            }
+            children.put(seq, childId);
+            if (history.resolution(seq) == null) {
+                pendingChildren.add(new PendingChild(seq, workflowType, childId, encoded));
+            }
+            return new Promise<>(() -> history.resolution(seq), resolution -> switch (resolution.event()) {
+                case Event.ChildCompleted done -> codec.decode(done.result(), type);
+                case Event.ChildFailed failed ->
+                        throw new ChildWorkflowFailedException(childId, failed.errorType(), failed.message());
+                default -> throw new IllegalStateException("unexpected " + resolution.event());
+            });
+        }
+
+        @Override
         public void sleep(Duration duration) {
             timer(duration).get();
         }
 
         @Override
         public DurablePromise<Void> timer(Duration duration) {
-            checkOpen();
-            int seq = nextSeq++;
-            Event recorded = history.command(seq);
+            int seq = nextCommand();
+            Event recorded = recorded(seq);
             if (recorded == null) {
                 newEvents.add(new Event.TimerStarted(seq, clock.instant().plus(duration)));
             } else if (!(recorded instanceof Event.TimerStarted)) {
@@ -315,15 +413,16 @@ final class Replay implements AutoCloseable {
             while (true) {
                 checkOpen();
                 Promise<?> first = null;
-                int firstAt = Integer.MAX_VALUE;
+                Resolution firstAt = null;
                 for (DurablePromise<?> candidate : promises) {
                     Promise<?> promise = (Promise<?>) candidate;
                     Resolution resolution = promise.lookup.get();
-                    if (resolution != null && resolution.position() < firstAt) {
+                    if (resolution != null && (firstAt == null || resolution.position() < firstAt.position())) {
                         first = promise;
-                        firstAt = resolution.position();
+                        firstAt = resolution;
                     }
                 }
+                throwIfCancelledBefore(firstAt);
                 if (first != null) {
                     return first;
                 }
@@ -335,7 +434,7 @@ final class Replay implements AutoCloseable {
         public <T> T sideEffect(Class<T> type, Supplier<T> supplier) {
             checkOpen();
             int seq = nextSeq++;
-            Event recorded = history.command(seq);
+            Event recorded = recorded(seq);
             String value;
             if (recorded == null) {
                 value = codec.encode(supplier.get());
@@ -347,6 +446,33 @@ final class Replay implements AutoCloseable {
             }
             // Always decoded from the journaled form, so the first run sees what replays will see.
             return codec.decode(value, type);
+        }
+
+        @Override
+        public int version(String changeId, int maxSupported) {
+            checkOpen();
+            Integer answered = versionAnswers.get(changeId);
+            if (answered != null) {
+                return answered;
+            }
+            Integer marked = history.markedVersion(changeId);
+            int version;
+            if (marked != null) {
+                if (marked > maxSupported) {
+                    throw new NonDeterminismError("change '" + changeId + "' was recorded at version " + marked
+                            + " but this code supports it only up to version " + maxSupported);
+                }
+                version = marked;
+            } else if (history.maxCommandSeq() >= nextSeq) {
+                // The history goes on past this point without a marker: this execution ran
+                // through here before the change existed, and must keep to the original path.
+                version = 0;
+            } else {
+                version = maxSupported;
+                newEvents.add(new Event.VersionMarked(changeId, version));
+            }
+            versionAnswers.put(changeId, version);
+            return version;
         }
 
         @Override

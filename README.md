@@ -54,6 +54,37 @@ time, scheduling and step execution from an
 [EngineRuntime](src/main/java/dev/tenaz/engine/EngineRuntime.java). In production that is virtual
 threads and the wall clock; under test it is a single-threaded event loop driven by a seed.
 
+## Children, cancellation and code changes
+
+```java
+engine.register("checkout", Cart.class, String.class, (ctx, cart) -> {
+    // Children are ordinary workflows with their own history. The parent holds nothing while
+    // it waits, and a child's outcome reaches it in the same atomic write that ends the child.
+    DurablePromise<String> payment = ctx.childAsync("payment", ctx.workflowId() + "/pay", cart, String.class);
+    DurablePromise<String> stock = ctx.childAsync("reserve-stock", ctx.workflowId() + "/stock", cart, String.class);
+    try {
+        payment.get();
+        stock.get();
+    } catch (WorkflowCancelledException e) {
+        // handle.cancel(...) arrives as an exception, once, and is passed on to
+        // the children still running. The code may keep using the context to clean up.
+        ctx.run("notify-customer", step -> mail.cancelled(cart));
+        throw e;
+    }
+    // Executions that passed this point before the fraud check existed get 0 and skip it;
+    // new ones get 1, recorded in their history so that every replay agrees.
+    if (ctx.version("add-fraud-check", 1) >= 1) {
+        ctx.run("fraud-check", step -> fraud.check(cart));
+    }
+    return ctx.step("ship", String.class, step -> warehouse.ship(cart));
+});
+```
+
+Cancellation is ordered like everything else, by position in the history. A result recorded
+before the request is still returned; a wait for anything recorded after it, or an attempt to
+start something new, throws. A replay therefore delivers the cancellation at exactly the point
+where the live execution saw it.
+
 ## Guarantees
 
 | | |
@@ -63,22 +94,29 @@ threads and the wall clock; under test it is a single-threaded event loop driven
 | Step in flight during a crash | Executed again: **at-least-once**, with a stable idempotency key to make its effect exactly-once |
 | Timers | Survive restarts; fire once |
 | Starting a workflow | Idempotent on the workflow id |
+| Child outcome | Reaches the parent exactly once, atomically with the end of the child |
+| Starting a child | Only by the parent's current owner; a worker that lost the parent cannot |
+| Cancelling a parent | Cancels the children it is still waiting for |
 
 ## Evidence
 
 **Deterministic simulation.** [SimulationTest](src/test/java/dev/tenaz/sim/SimulationTest.java)
 runs a three-node cluster inside one thread, with simulated time and every source of randomness
-drawn from one seed. For thirty simulated seconds, nodes crash and restart, freeze for longer than
-their leases and wake up as zombies, run on skewed clocks, lose notifications, and see journal
-operations fail both before and after committing. Then the faults stop and the run must converge:
-every workflow finished, every effect applied exactly once, every history well-formed.
+drawn from one seed. For thirty simulated seconds, clients start, signal and cancel workflows, some
+of which run children, while nodes crash and restart, freeze for longer than their leases and wake
+up as zombies, run on skewed clocks, lose notifications, and see journal operations fail both
+before and after committing. Then the faults stop and the run must converge: every workflow ended,
+every effect applied exactly once, every history well-formed, and no money created or lost by the
+transfers that were cancelled halfway and had to refund.
 
-- 500 seeds run on every build in a few seconds; 30,000 seeds (257 hours of simulated time,
-  290,000 crashes, 940,000 journal failures) run in under three minutes and pass.
+- 500 seeds run on every build in a few seconds; 20,000 seeds (170 hours of simulated time,
+  200,000 crashes, 650,000 journal failures, 65,000 cancelled workflows) run in two minutes and
+  pass.
 - A failing seed fails identically every time: `./mvnw test -Dtest=SimulationTest -Dtenaz.sim.seed=16`.
 - The simulator is itself tested for the ability to fail. With fencing removed from the journal,
-  it finds the resulting double write. With `anyOf` changed to prefer its first argument over
-  history order, it reports the broken workflow at seed 16.
+  it finds the resulting double write. Two deliberate bugs were also tried by hand: with `anyOf`
+  preferring its first argument over history order it reported the broken workflow at seed 16,
+  and with cancellation ignoring history order, at seed 0.
 
 **Real processes.** The same test suites run against both journals.
 
@@ -165,7 +203,14 @@ apart, so treat every figure as an order of magnitude.
   about a real server or a network between engine and database.
 - Retry attempts are counted per worker; a takeover restarts the count.
 - Payload types are plain classes (`Class<T>`); generic types such as `List<Foo>` are not supported.
-- No workflow versioning: changing the code of a workflow with executions in flight fails them.
+- Changing workflow code under executions in flight is safe only behind `ctx.version`; an
+  unguarded change fails them with `NonDeterminismError`.
+- Cancellation does not interrupt a step that is already running; the workflow code decides
+  whether to wait for it.
+- A child whose type no running engine has registered is never picked up, and its parent waits.
+- Under PostgreSQL, a write that touches two workflows (a child ending, a parent cancelling
+  children) can deadlock with a concurrent one in the opposite direction. PostgreSQL aborts one of
+  them and the engine redoes it from the journal; it costs time, not correctness.
 - `finally` blocks in workflow code also run whenever an engine lets go of the workflow, not only
   when the workflow ends.
 - Signals are not deduplicated: a client that retries a signal after an ambiguous failure may
@@ -175,5 +220,5 @@ apart, so treat every figure as an order of magnitude.
 
 ## Roadmap
 
-1. Child workflows, cancellation, versioning
-2. Spring Boot starter and a history viewer
+1. Spring Boot starter
+2. A history viewer

@@ -44,6 +44,7 @@ class SimulationTest {
         long failures = 0;
         long repeated = 0;
         long simulatedSeconds = 0;
+        long cancelled = 0;
         long started = System.nanoTime();
         for (long seed = first; seed < first + count; seed++) {
             Simulation.Report report = Simulation.run(seed);
@@ -53,11 +54,12 @@ class SimulationTest {
             failures += report.journalFailures();
             repeated += report.repeatedExecutions();
             simulatedSeconds += report.simulatedTime().toSeconds();
+            cancelled += report.cancelled();
         }
         System.out.printf("simulation: %d seeds, %d events, %d h of simulated time in %d s; injected %d crashes, "
-                        + "%d freezes, %d journal failures; %d step executions repeated%n",
+                        + "%d freezes, %d journal failures; %d step executions repeated; %d workflows cancelled%n",
                 count, events, simulatedSeconds / 3600, (System.nanoTime() - started) / 1_000_000_000,
-                crashes, pauses, failures, repeated);
+                crashes, pauses, failures, repeated, cancelled);
         assertTrue(single != null || repeated > 0, "the faults must have bitten, or this test proves nothing");
     }
 
