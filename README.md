@@ -207,7 +207,7 @@ order outlive the process that started it:
 ```
 docker compose -f example/docker-compose.yml up -d
 ./mvnw -q install -DskipTests
-java -jar example/target/tenaz-example-0.1.0-SNAPSHOT.jar --spring.profiles.active=postgres
+java -jar example/target/tenaz-example.jar --spring.profiles.active=postgres
 
 curl -X POST localhost:8080/orders -H "Content-Type: application/json" -d '{"item":"keyboard","amountCents":4990}'
 # stop the application, start it again, then:

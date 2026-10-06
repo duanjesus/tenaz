@@ -7,7 +7,7 @@
     <parent>
         <groupId>dev.tenaz</groupId>
         <artifactId>tenaz-parent</artifactId>
-        <version>0.1.0-SNAPSHOT</version>
+        <version>0.1.0</version>
     </parent>
 
     <artifactId>tenaz-example</artifactId>
@@ -54,6 +54,7 @@
     </dependencies>
 
     <build>
+        <finalName>tenaz-example</finalName>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
