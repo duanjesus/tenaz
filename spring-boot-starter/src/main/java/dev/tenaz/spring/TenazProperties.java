@@ -34,6 +34,9 @@ public class TenazProperties {
     /** How many workflows this engine drives at the same time. */
     private int maxConcurrentWorkflows = 1000;
 
+    /** How long to keep a workflow after it ends; unset keeps everything forever. */
+    private Duration retention;
+
     private final Viewer viewer = new Viewer();
 
     public static class Viewer {
@@ -51,6 +54,14 @@ public class TenazProperties {
         public void setEnabled(boolean enabled) {
             this.enabled = enabled;
         }
+    }
+
+    public Duration getRetention() {
+        return retention;
+    }
+
+    public void setRetention(Duration retention) {
+        this.retention = retention;
     }
 
     public Viewer getViewer() {

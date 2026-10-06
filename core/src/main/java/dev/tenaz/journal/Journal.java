@@ -77,6 +77,15 @@ public interface Journal {
     void abandon(Lease lease);
 
     /**
+     * Deletes up to {@code limit} workflows that ended before the given instant, with their
+     * histories, oldest first. Returns how many were deleted. A deleted workflow is gone as if
+     * it had never existed: its id can be started again, and a late delivery to it is dropped.
+     *
+     * <p>When a workflow ended is the journal's own record of it, by the journal's clock.
+     */
+    int purge(Instant endedBefore, int limit);
+
+    /**
      * Registers a listener that is told when a workflow's history grows. Notifications are
      * best-effort: they may be lost, repeated or late, and exist only to save callers from
      * waiting for their next poll. The listener must not block. Returns a handle that unsubscribes.

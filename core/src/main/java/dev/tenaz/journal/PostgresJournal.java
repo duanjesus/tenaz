@@ -83,11 +83,30 @@ public final class PostgresJournal implements Journal, JournalBrowser, AutoClose
             ALTER TABLE tenaz_workflows ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
             ALTER TABLE tenaz_events ADD COLUMN IF NOT EXISTS recorded_at timestamptz NOT NULL DEFAULT now();
             CREATE INDEX IF NOT EXISTS tenaz_workflows_created ON tenaz_workflows (created_at DESC);
+            -- When a workflow ended, so that old ones can be found and deleted without a scan.
+            ALTER TABLE tenaz_workflows ADD COLUMN IF NOT EXISTS ended_at timestamptz;
+            UPDATE tenaz_workflows w
+               SET ended_at = (SELECT e.recorded_at FROM tenaz_events e
+                                WHERE e.workflow_id = w.id AND e.seq = w.version - 1)
+             WHERE w.status <> 'RUNNING' AND w.ended_at IS NULL;
+            CREATE INDEX IF NOT EXISTS tenaz_workflows_ended
+                ON tenaz_workflows (ended_at) WHERE ended_at IS NOT NULL;
             """;
 
     // The object the schema script creates last. While it is missing the script has work to do,
     // whether on an empty database or on one that an earlier version set up.
-    private static final String LAST_SCHEMA_OBJECT = "tenaz_workflows_created";
+    private static final String LAST_SCHEMA_OBJECT = "tenaz_workflows_ended";
+
+    // Events and timers go with their workflow: the tables cascade.
+    private static final String PURGE = """
+            DELETE FROM tenaz_workflows
+             WHERE id IN (
+                   SELECT id FROM tenaz_workflows
+                    WHERE ended_at < ?
+                    ORDER BY ended_at
+                    LIMIT ?
+                      FOR UPDATE SKIP LOCKED)
+            """;
 
     private static final String LIST = """
             SELECT w.id, w.type, w.status, w.version, w.created_at, last.recorded_at, first.payload ->> 'parentId'
@@ -137,7 +156,8 @@ public final class PostgresJournal implements Journal, JournalBrowser, AutoClose
             WITH w AS (
                 UPDATE tenaz_workflows
                    SET version = version + ?, status = ?, ready = true,
-                       lease_expiry = CASE WHEN ? THEN NULL ELSE lease_expiry END
+                       lease_expiry = CASE WHEN ? THEN NULL ELSE lease_expiry END,
+                       ended_at = CASE WHEN ? THEN now() END
                  WHERE id = ? AND status = 'RUNNING'%s
              RETURNING id, version - ? AS base, version,
                        status = 'RUNNING' AND lease_expiry IS NULL AS claimable
@@ -550,6 +570,17 @@ public final class PostgresJournal implements Journal, JournalBrowser, AutoClose
     }
 
     @Override
+    public int purge(Instant endedBefore, int limit) {
+        return execute(conn -> {
+            try (PreparedStatement delete = conn.prepareStatement(PURGE)) {
+                delete.setObject(1, timestamp(endedBefore));
+                delete.setInt(2, limit);
+                return delete.executeUpdate();
+            }
+        });
+    }
+
+    @Override
     public Runnable subscribe(ChangeListener listener) {
         listeners.add(listener);
         return () -> listeners.remove(listener);
@@ -635,6 +666,7 @@ public final class PostgresJournal implements Journal, JournalBrowser, AutoClose
             int p = 1;
             statement.setInt(p++, events.size());
             statement.setString(p++, status.name());
+            statement.setBoolean(p++, status != WorkflowStatus.RUNNING);
             statement.setBoolean(p++, status != WorkflowStatus.RUNNING);
             statement.setString(p++, workflowId);
             if (lease != null) {

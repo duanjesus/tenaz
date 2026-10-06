@@ -93,7 +93,7 @@ where the live execution saw it.
 | Journaled step | Never executed again |
 | Step in flight during a crash | Executed again: **at-least-once**, with a stable idempotency key to make its effect exactly-once |
 | Timers | Survive restarts; fire once |
-| Starting a workflow | Idempotent on the workflow id |
+| Starting a workflow | Idempotent on the workflow id, for as long as the workflow is kept |
 | Child outcome | Reaches the parent exactly once, atomically with the end of the child |
 | Starting a child | Only by the parent's current owner; a worker that lost the parent cannot |
 | Cancelling a parent | Cancels the children it is still waiting for |
@@ -198,6 +198,7 @@ at startup; otherwise they are kept in memory. Payloads are encoded with the app
 | `tenaz.poll-interval` | `50ms` | how often to look for work no notification announced |
 | `tenaz.max-concurrent-workflows` | `1000` | |
 | `tenaz.worker-id` | random | this engine's name in leases |
+| `tenaz.retention` | unset | delete workflows this long after they end; unset keeps them forever |
 | `tenaz.viewer.enabled` | `false` | serve the history viewer at `/tenaz` |
 
 [example](example) is a small order service built this way: an order is charged, waits for
@@ -230,6 +231,18 @@ to child and back. The example has it on.
 The viewer only reads. It has no access control of its own, so put `/tenaz` behind the
 application's security before enabling it anywhere that matters. The times it shows are when the
 journal recorded each event, by the journal's clock; nothing the engine decides depends on them.
+
+## Retention
+
+By default nothing is ever deleted. With a retention set, a workflow and its history are deleted
+that long after the workflow ends; running workflows are never touched, however old.
+
+```java
+TenazEngine.builder(journal).retention(Duration.ofDays(30)).build();   // or tenaz.retention=30d
+```
+
+Deleted means gone: the id can be started again, which is what bounds the window in which
+starting a workflow is idempotent.
 
 ## Benchmarks
 

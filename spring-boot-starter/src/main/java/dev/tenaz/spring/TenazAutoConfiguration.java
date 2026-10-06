@@ -72,6 +72,9 @@ public class TenazAutoConfiguration {
                 .leaseTtl(properties.getLeaseTtl())
                 .pollInterval(properties.getPollInterval())
                 .maxConcurrentWorkflows(properties.getMaxConcurrentWorkflows());
+        if (properties.getRetention() != null) {
+            builder.retention(properties.getRetention());
+        }
         if (properties.getWorkerId() != null) {
             builder.workerId(properties.getWorkerId());
         }

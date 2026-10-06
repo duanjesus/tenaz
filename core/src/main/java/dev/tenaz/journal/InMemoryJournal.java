@@ -41,6 +41,7 @@ public final class InMemoryJournal implements Journal, JournalBrowser {
         WorkflowStatus status = WorkflowStatus.RUNNING;
         long epoch;
         Instant leaseExpiry;
+        Instant endedAt;
 
         Entry(String type) {
             this.type = type;
@@ -249,6 +250,24 @@ public final class InMemoryJournal implements Journal, JournalBrowser {
     }
 
     @Override
+    public int purge(Instant endedBefore, int limit) {
+        lock.lock();
+        try {
+            List<String> expired = workflows.entrySet().stream()
+                    .filter(e -> e.getValue().endedAt != null && e.getValue().endedAt.isBefore(endedBefore))
+                    .sorted(Comparator.comparing((Map.Entry<String, Entry> e) -> e.getValue().endedAt)
+                            .thenComparing(Map.Entry::getKey))
+                    .limit(limit)
+                    .map(Map.Entry::getKey)
+                    .toList();
+            expired.forEach(workflows::remove);
+            return expired.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
     public Runnable subscribe(ChangeListener listener) {
         listeners.add(listener);
         return () -> listeners.remove(listener);
@@ -372,6 +391,7 @@ public final class InMemoryJournal implements Journal, JournalBrowser {
 
     private void finish(String workflowId, Entry entry, WorkflowStatus status) {
         entry.status = status;
+        entry.endedAt = Instant.now();
         entry.leaseExpiry = null;
         entry.pendingTimers.clear();
         candidates.remove(workflowId);

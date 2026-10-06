@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Retention: `TenazEngine.Builder.retention` and `tenaz.retention` delete a workflow and its
+  history a set time after it ends. PostgreSQL gains an `ended_at` column, added by `migrate()`.
+
 ## 0.1.1 (2026-10-06)
 
 - Licensed under the MIT License. No code changes since 0.1.0.

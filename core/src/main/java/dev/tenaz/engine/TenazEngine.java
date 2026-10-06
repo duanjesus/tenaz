@@ -52,6 +52,7 @@ public final class TenazEngine implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(TenazEngine.class.getName());
     private static final int CLAIM_BATCH = 64;
+    private static final int PURGE_BATCH = 500;
     private static final String WORKFLOW_ID_IN_USE = "dev.tenaz.WorkflowIdInUse";
     private static final Comparator<Lease> BY_WORKFLOW =
             Comparator.comparing(Lease::workflowId).thenComparingLong(Lease::epoch);
@@ -62,6 +63,7 @@ public final class TenazEngine implements AutoCloseable {
     private final String workerId;
     private final Duration leaseTtl;
     private final Duration pollInterval;
+    private final Duration retention;
     private final Semaphore slots;
     private final Map<String, WorkflowDefinition<?, ?>> definitions = new ConcurrentHashMap<>();
     // Ordered, so that a simulation visits sessions in the same order on every run.
@@ -79,6 +81,7 @@ public final class TenazEngine implements AutoCloseable {
         this.workerId = builder.workerId;
         this.leaseTtl = builder.leaseTtl;
         this.pollInterval = builder.pollInterval;
+        this.retention = builder.retention;
         this.slots = new Semaphore(builder.maxConcurrentWorkflows);
         this.dispatcher = new SerialTask(runtime, guarded(this::claimAvailable));
     }
@@ -100,6 +103,9 @@ public final class TenazEngine implements AutoCloseable {
         every(pollInterval, this::fireTimers);
         // On its own schedule: nothing else the engine does may delay a heartbeat.
         every(leaseTtl.dividedBy(3), this::renewLeases);
+        if (retention != null) {
+            every(purgeInterval(), this::purgeEnded);
+        }
         return this;
     }
 
@@ -233,6 +239,22 @@ public final class TenazEngine implements AutoCloseable {
     }
 
     /** A lease that cannot be renewed simply expires; the fencing epoch keeps that safe. */
+    /** Often enough that nothing outlives its retention by more than a tenth of it. */
+    private Duration purgeInterval() {
+        Duration tenth = retention.dividedBy(10);
+        if (tenth.compareTo(Duration.ofMinutes(1)) > 0) {
+            return Duration.ofMinutes(1);
+        }
+        return tenth.compareTo(Duration.ofMillis(100)) < 0 ? Duration.ofMillis(100) : tenth;
+    }
+
+    private void purgeEnded() {
+        Instant cutoff = runtime.clock().instant().minus(retention);
+        while (!stopped && live().purge(cutoff, PURGE_BATCH) == PURGE_BATCH) {
+            // more to delete: carry on in batches, so that no single statement holds many locks
+        }
+    }
+
     private void renewLeases() {
         List<Lease> held = List.copyOf(sessions.keySet());
         Set<Lease> renewed = live().renew(held, leaseTtl, runtime.clock().instant());
@@ -605,6 +627,7 @@ public final class TenazEngine implements AutoCloseable {
         private String workerId = "worker-" + UUID.randomUUID();
         private Duration leaseTtl = Duration.ofSeconds(10);
         private Duration pollInterval = Duration.ofMillis(50);
+        private Duration retention;
         private int maxConcurrentWorkflows = 1000;
 
         private Builder(Journal journal) {
@@ -634,6 +657,16 @@ public final class TenazEngine implements AutoCloseable {
         }
 
         /** How often to look for work that no notification announced, such as expired leases. */
+        /**
+         * How long to keep a workflow after it ends. Once that time has passed the workflow and
+         * its history are deleted, and its id can be started again. Without this, nothing is
+         * ever deleted.
+         */
+        public Builder retention(Duration retention) {
+            this.retention = retention;
+            return this;
+        }
+
         public Builder pollInterval(Duration pollInterval) {
             this.pollInterval = pollInterval;
             return this;

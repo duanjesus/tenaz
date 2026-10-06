@@ -177,6 +177,28 @@ abstract class JournalContractTest {
         assertTrue(browser.events("nobody").isEmpty());
     }
 
+    @Test
+    void purgeDeletesOnlyWorkflowsThatEndedBeforeTheCutoff() {
+        create("done-1");
+        create("done-2");
+        create("running");
+        for (Lease lease : journal.claim("a", TYPES, TTL, T0, 2)) {
+            journal.append(lease, 1, List.of(new Event.WorkflowCompleted("1")));
+        }
+        Instant past = Instant.now().minusSeconds(60);
+        Instant future = Instant.now().plusSeconds(60);
+
+        assertEquals(0, journal.purge(past, 10), "nothing ended that long ago");
+        assertEquals(1, journal.purge(future, 1), "the limit is respected");
+        assertEquals(1, journal.purge(future, 10));
+        assertEquals(0, journal.purge(future, 10), "a running workflow is never purged");
+        assertTrue(journal.load("running").isPresent());
+        assertTrue(journal.load("done-1").isEmpty());
+        assertTrue(journal.loadSince("done-2", 0).isEmpty());
+
+        assertTrue(journal.create("done-1", new Event.WorkflowStarted("t", "null", T0)), "the id is free again");
+    }
+
     private static List<String> ids(JournalBrowser browser, JournalBrowser.Filter filter) {
         return browser.list(filter, 10).stream().map(JournalBrowser.WorkflowSummary::id).toList();
     }

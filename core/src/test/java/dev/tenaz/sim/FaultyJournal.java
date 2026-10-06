@@ -159,6 +159,11 @@ final class FaultyJournal implements Journal {
     }
 
     @Override
+    public int purge(Instant endedBefore, int limit) {
+        return attempt(() -> delegate.purge(endedBefore, limit));
+    }
+
+    @Override
     public Runnable subscribe(ChangeListener listener) {
         return delegate.subscribe((workflowId, version, claimable) -> {
             if (world.random.nextDouble() >= faults.dropNotification) {
