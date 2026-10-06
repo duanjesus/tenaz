@@ -16,6 +16,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -40,7 +41,7 @@ import org.postgresql.PGNotification;
  * never queue behind each other. Changes are announced through {@code LISTEN/NOTIFY}, with
  * polling as the fallback in case a notification is lost with its connection.
  */
-public final class PostgresJournal implements Journal, AutoCloseable {
+public final class PostgresJournal implements Journal, JournalBrowser, AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(PostgresJournal.class.getName());
     private static final String CHANNEL = "tenaz_changes";
@@ -78,9 +79,27 @@ public final class PostgresJournal implements Journal, AutoCloseable {
                 PRIMARY KEY (workflow_id, seq)
             );
             CREATE INDEX IF NOT EXISTS tenaz_timers_due ON tenaz_timers (fire_at);
+            -- When things were recorded, by the database's clock: for people, not for engines.
+            ALTER TABLE tenaz_workflows ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+            ALTER TABLE tenaz_events ADD COLUMN IF NOT EXISTS recorded_at timestamptz NOT NULL DEFAULT now();
+            CREATE INDEX IF NOT EXISTS tenaz_workflows_created ON tenaz_workflows (created_at DESC);
             """;
 
-    private static final String LAST_SCHEMA_OBJECT = "tenaz_timers_due";
+    // The object the schema script creates last. While it is missing the script has work to do,
+    // whether on an empty database or on one that an earlier version set up.
+    private static final String LAST_SCHEMA_OBJECT = "tenaz_workflows_created";
+
+    private static final String LIST = """
+            SELECT w.id, w.type, w.status, w.version, w.created_at, last.recorded_at, first.payload ->> 'parentId'
+              FROM tenaz_workflows w
+              JOIN tenaz_events first ON first.workflow_id = w.id AND first.seq = 0
+              JOIN tenaz_events last ON last.workflow_id = w.id AND last.seq = w.version - 1
+             WHERE (?::text IS NULL OR w.type = ?)
+               AND (?::text IS NULL OR w.status = ?)
+               AND (?::text IS NULL OR w.id ILIKE '%' || ? || '%')
+             ORDER BY w.created_at DESC, w.id
+             LIMIT ?
+            """;
 
     private static final String CREATE = """
             WITH w AS (
@@ -467,6 +486,66 @@ public final class PostgresJournal implements Journal, AutoCloseable {
                 throw new FencedException(lease);
             }
             return false;
+        });
+    }
+
+    @Override
+    public List<WorkflowSummary> list(Filter filter, int limit) {
+        return execute(conn -> {
+            try (PreparedStatement select = conn.prepareStatement(LIST)) {
+                String status = filter.status() == null ? null : filter.status().name();
+                select.setString(1, filter.type());
+                select.setString(2, filter.type());
+                select.setString(3, status);
+                select.setString(4, status);
+                select.setString(5, filter.idContains());
+                select.setString(6, filter.idContains());
+                select.setInt(7, limit);
+                List<WorkflowSummary> summaries = new ArrayList<>();
+                try (ResultSet rows = select.executeQuery()) {
+                    while (rows.next()) {
+                        summaries.add(new WorkflowSummary(rows.getString(1), rows.getString(2),
+                                WorkflowStatus.valueOf(rows.getString(3)), rows.getLong(4),
+                                rows.getObject(5, OffsetDateTime.class).toInstant(),
+                                rows.getObject(6, OffsetDateTime.class).toInstant(), rows.getString(7)));
+                    }
+                }
+                return summaries;
+            }
+        });
+    }
+
+    @Override
+    public Map<WorkflowStatus, Long> countByStatus() {
+        return execute(conn -> {
+            try (Statement statement = conn.createStatement();
+                 ResultSet rows = statement.executeQuery(
+                         "SELECT status, count(*) FROM tenaz_workflows GROUP BY status")) {
+                Map<WorkflowStatus, Long> counts = new EnumMap<>(WorkflowStatus.class);
+                while (rows.next()) {
+                    counts.put(WorkflowStatus.valueOf(rows.getString(1)), rows.getLong(2));
+                }
+                return counts;
+            }
+        });
+    }
+
+    @Override
+    public List<RecordedEvent> events(String workflowId) {
+        return execute(conn -> {
+            try (PreparedStatement select = conn.prepareStatement(
+                    "SELECT seq, recorded_at, type, payload FROM tenaz_events WHERE workflow_id = ? ORDER BY seq")) {
+                select.setString(1, workflowId);
+                List<RecordedEvent> recorded = new ArrayList<>();
+                try (ResultSet rows = select.executeQuery()) {
+                    while (rows.next()) {
+                        recorded.add(new RecordedEvent(rows.getLong(1),
+                                rows.getObject(2, OffsetDateTime.class).toInstant(),
+                                decode(rows.getString(3), rows.getString(4))));
+                    }
+                }
+                return recorded;
+            }
         });
     }
 

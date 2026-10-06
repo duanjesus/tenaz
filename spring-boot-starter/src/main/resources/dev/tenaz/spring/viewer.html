@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tenaz</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --line: #e1e4ea; --text: #1b1f27; --muted: #667085;
+    --accent: #3157d5; --hover: #f0f3f9; --selected: #e7edfd; --code: #f3f4f7;
+    --running: #2563eb; --completed: #15803d; --failed: #c2410c; --cancelled: #6b7280; --waiting: #a16207;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101319; --panel: #171b23; --line: #272d39; --text: #e6e9ef; --muted: #8b93a3;
+      --accent: #8aa4ff; --hover: #1c212b; --selected: #1f2a47; --code: #1d222c;
+      --running: #6ea0ff; --completed: #4ade80; --failed: #fb923c; --cancelled: #9ca3af; --waiting: #facc15;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; font-size: 12.5px; }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: .01em; }
+  header h1 span { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    border: 1px solid var(--line); background: transparent; color: var(--text);
+    border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 13px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .chip:hover { background: var(--hover); }
+  .chip[aria-pressed="true"] { background: var(--selected); border-color: var(--accent); }
+  .chip b { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .RUNNING { background: var(--running); } .COMPLETED { background: var(--completed); }
+  .FAILED { background: var(--failed); } .CANCELLED { background: var(--cancelled); }
+  .waiting { background: var(--waiting); }
+  .spacer { flex: 1; }
+  input[type="search"] {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 9px; width: 220px; max-width: 100%;
+  }
+  input[type="search"]:focus, button:focus-visible, tr:focus-visible, a:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+  label.toggle { color: var(--muted); font-size: 13px; display: inline-flex; align-items: center; gap: 6px; }
+  main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+  main.split { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); }
+  section { min-height: 0; overflow: auto; }
+  #list { border-right: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    position: sticky; top: 0; background: var(--bg); text-align: left; font-weight: 500;
+    color: var(--muted); font-size: 12px; padding: 8px 12px; border-bottom: 1px solid var(--line);
+  }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td.id { overflow: hidden; text-overflow: ellipsis; max-width: 0; width: 45%; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--hover); }
+  tbody tr[aria-selected="true"] { background: var(--selected); }
+  .status { display: inline-flex; align-items: center; gap: 6px; }
+  .empty { padding: 48px 20px; color: var(--muted); text-align: center; }
+  #detail { background: var(--panel); padding: 18px 22px 40px; }
+  #detail h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; word-break: break-all; }
+  .facts { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .facts b { color: var(--text); font-weight: 500; }
+  a { color: var(--accent); text-decoration: none; cursor: pointer; }
+  a:hover { text-decoration: underline; }
+  button.plain {
+    font: inherit; font-size: 13px; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer;
+  }
+  ol.timeline { list-style: none; margin: 0; padding: 0; }
+  ol.timeline li { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 0 10px; position: relative; }
+  ol.timeline li::before {
+    content: ""; position: absolute; left: 3.5px; top: 14px; bottom: -6px; width: 1px; background: var(--line);
+  }
+  ol.timeline li:last-child::before { display: none; }
+  ol.timeline .dot { margin-top: 6px; z-index: 1; }
+  .item { padding-bottom: 14px; min-width: 0; }
+  .item .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+  .item .title { font-weight: 550; }
+  .item .kind { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .item .meta { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  pre {
+    margin: 6px 0 0; padding: 7px 9px; background: var(--code); border-radius: 6px;
+    white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto;
+  }
+  .error { color: var(--failed); }
+  .bar { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+  @media (max-width: 900px) {
+    main.split { grid-template-columns: minmax(0, 1fr); }
+    main.split #list { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tenaz <span>workflows</span></h1>
+  <div class="chips" id="chips" role="group" aria-label="Filter by status"></div>
+  <div class="spacer"></div>
+  <input type="search" id="search" placeholder="Search by id" aria-label="Search by id">
+  <label class="toggle"><input type="checkbox" id="auto" checked> Refresh every 2 s</label>
+</header>
+<main id="main">
+  <section id="list" aria-label="Workflows">
+    <table>
+      <thead><tr><th>Status</th><th>Id</th><th>Type</th><th style="text-align:right">Events</th><th>Started</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden></div>
+  </section>
+  <section id="detail" aria-label="Workflow history" hidden></section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var base = location.pathname.replace(/\/$/, "");
+  var STATUSES = ["RUNNING", "COMPLETED", "FAILED", "CANCELLED"];
+  var state = { status: null, q: "", selected: null, raw: false };
+  var lastDetail = null;
+
+  function h(tag, attrs) {
+    var node = document.createElement(tag);
+    for (var name in attrs || {}) {
+      if (name === "text") node.textContent = attrs[name];
+      else if (name === "on") for (var type in attrs.on) node.addEventListener(type, attrs.on[type]);
+      else if (attrs[name] !== null && attrs[name] !== undefined) node.setAttribute(name, attrs[name]);
+    }
+    for (var i = 2; i < arguments.length; i++) {
+      var child = arguments[i];
+      if (child !== null && child !== undefined) node.append(child);
+    }
+    return node;
+  }
+
+  function label(status) { return status.charAt(0) + status.slice(1).toLowerCase(); }
+
+  function ago(iso) {
+    var seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (seconds < 60) return Math.floor(seconds) + " s ago";
+    if (seconds < 3600) return Math.floor(seconds / 60) + " min ago";
+    if (seconds < 86400) return Math.floor(seconds / 3600) + " h ago";
+    return new Date(iso).toLocaleDateString();
+  }
+
+  function clock(iso) {
+    var d = new Date(iso);
+    return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+  }
+
+  function span(fromIso, toIso) {
+    var ms = new Date(toIso) - new Date(fromIso);
+    if (ms < 1000) return Math.max(0, ms) + " ms";
+    if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + " s";
+    if (ms < 3600000) return Math.floor(ms / 60000) + " min " + Math.floor(ms % 60000 / 1000) + " s";
+    return Math.floor(ms / 3600000) + " h " + Math.floor(ms % 3600000 / 60000) + " min";
+  }
+
+  /** Payloads are stored as JSON text; show them as the JSON they are. */
+  function pretty(text) {
+    if (text === null || text === undefined || text === "null") return null;
+    try { return JSON.stringify(JSON.parse(text), null, 2); } catch (e) { return String(text); }
+  }
+
+  function select(id) {
+    state.selected = id;
+    history.replaceState(null, "", id ? "#" + encodeURIComponent(id) : location.pathname);
+    lastDetail = null;
+    refresh();
+  }
+
+  function renderChips(counts) {
+    var total = STATUSES.reduce(function (sum, s) { return sum + (counts[s] || 0); }, 0);
+    var chips = [h("button", { class: "chip", "aria-pressed": String(state.status === null),
+      on: { click: function () { state.status = null; refresh(); } } }, "All ", h("b", { text: total }))];
+    STATUSES.forEach(function (status) {
+      chips.push(h("button", { class: "chip", "aria-pressed": String(state.status === status),
+        on: { click: function () { state.status = state.status === status ? null : status; refresh(); } } },
+        h("span", { class: "dot " + status }), label(status) + " ", h("b", { text: counts[status] || 0 })));
+    });
+    document.getElementById("chips").replaceChildren.apply(document.getElementById("chips"), chips);
+  }
+
+  function renderRows(workflows) {
+    var rows = workflows.map(function (w) {
+      return h("tr", { tabindex: "0", "aria-selected": String(w.id === state.selected),
+        on: { click: function () { select(w.id); },
+              keydown: function (e) { if (e.key === "Enter") select(w.id); } } },
+        h("td", null, h("span", { class: "status" }, h("span", { class: "dot " + w.status }), label(w.status))),
+        h("td", { class: "id mono", title: w.id, text: w.id }),
+        h("td", { text: w.type }),
+        h("td", { class: "num", text: w.events }),
+        h("td", { title: new Date(w.startedAt).toLocaleString(), text: ago(w.startedAt) }));
+    });
+    document.getElementById("rows").replaceChildren.apply(document.getElementById("rows"), rows);
+    var empty = document.getElementById("empty");
+    empty.hidden = rows.length > 0;
+    empty.textContent = state.status || state.q ? "No workflow matches this filter." : "No workflows yet.";
+  }
+
+  /** Pairs each command with its outcome, so that a step reads as one line with a duration. */
+  function timeline(events) {
+    var items = [], open = {};
+    events.forEach(function (e) {
+      var d = e.data, item;
+      switch (e.type) {
+        case "WorkflowStarted":
+          items.push({ kind: "start", title: "Started", at: e.at, tone: "COMPLETED", body: pretty(d.input), parent: d.parentId });
+          break;
+        case "StepScheduled":
+          open[d.seq] = item = { kind: "step", title: d.name, at: e.at, tone: "RUNNING", note: "running" };
+          items.push(item);
+          break;
+        case "TimerStarted":
+          open[d.seq] = item = { kind: "timer", title: "Timer", at: e.at, tone: "waiting",
+            note: "fires at " + clock(d.fireAt) };
+          items.push(item);
+          break;
+        case "ChildStarted":
+          open[d.seq] = item = { kind: "child", title: d.workflowType, at: e.at, tone: "RUNNING", note: "running",
+            child: d.childId, body: pretty(d.input) };
+          items.push(item);
+          break;
+        case "StepCompleted": case "ChildCompleted":
+          item = open[d.seq];
+          if (item) { item.tone = "COMPLETED"; item.note = "took " + span(item.at, e.at); item.body = pretty(d.result); }
+          break;
+        case "StepFailed": case "ChildFailed":
+          item = open[d.seq];
+          if (item) { item.tone = "FAILED"; item.note = "failed after " + span(item.at, e.at);
+            item.error = d.errorType + ": " + d.message; }
+          break;
+        case "TimerFired":
+          item = open[d.seq];
+          if (item) { item.tone = "COMPLETED"; item.note = "fired after " + span(item.at, e.at); }
+          break;
+        case "SideEffectRecorded":
+          items.push({ kind: "recorded", title: "Side effect", at: e.at, tone: "COMPLETED", body: pretty(d.value) });
+          break;
+        case "SignalReceived":
+          items.push({ kind: "signal", title: d.name, at: e.at, tone: "COMPLETED", body: pretty(d.payload) });
+          break;
+        case "CancelRequested":
+          items.push({ kind: "cancel", title: "Cancellation requested", at: e.at, tone: "CANCELLED", body: d.reason });
+          break;
+        case "VersionMarked":
+          items.push({ kind: "version", title: d.changeId, at: e.at, tone: "COMPLETED", note: "version " + d.version });
+          break;
+        case "WorkflowCompleted":
+          items.push({ kind: "end", title: "Completed", at: e.at, tone: "COMPLETED", body: pretty(d.result) });
+          break;
+        case "WorkflowFailed":
+          items.push({ kind: "end", title: "Failed", at: e.at, tone: "FAILED", error: d.errorType + ": " + d.message });
+          break;
+        case "WorkflowCancelled":
+          items.push({ kind: "end", title: "Cancelled", at: e.at, tone: "CANCELLED", body: d.reason });
+          break;
+      }
+    });
+    // Whatever was still pending when the workflow ended will never finish.
+    var ended = events.length > 0 && /^Workflow(Completed|Failed|Cancelled)$/.test(events[events.length - 1].type);
+    if (ended) {
+      items.forEach(function (item) {
+        if (item.tone === "RUNNING" || item.tone === "waiting") {
+          item.tone = "CANCELLED";
+          item.note = item.kind === "timer" ? "never fired" : "left unfinished";
+        }
+      });
+    }
+    return items;
+  }
+
+  function link(id) {
+    return h("a", { class: "mono", href: "#" + encodeURIComponent(id), text: id,
+      on: { click: function (e) { e.preventDefault(); select(id); } } });
+  }
+
+  function renderDetail(detail) {
+    var w = detail.workflow, panel = document.getElementById("detail");
+    var facts = h("div", { class: "facts" },
+      h("span", { class: "status" }, h("span", { class: "dot " + w.status }), h("b", { text: label(w.status) })),
+      h("span", null, "type ", h("b", { text: w.type })),
+      h("span", null, "started ", h("b", { text: new Date(w.startedAt).toLocaleString() })),
+      h("span", null, w.status === "RUNNING" ? "running for " : "ran for ",
+        h("b", { text: span(w.startedAt, w.status === "RUNNING" ? new Date().toISOString() : w.lastEventAt) })),
+      w.parentId ? h("span", null, "child of ", link(w.parentId)) : null);
+    var list;
+    if (state.raw) {
+      list = h("ol", { class: "timeline" });
+      detail.events.forEach(function (e) {
+        list.append(h("li", null, h("span", { class: "dot" }), h("div", { class: "item" },
+          h("div", { class: "head" }, h("span", { class: "title mono", text: "#" + e.seq + " " + e.type }),
+            h("span", { class: "meta", text: clock(e.at) })),
+          h("pre", { class: "mono", text: JSON.stringify(e.data, null, 2) }))));
+      });
+    } else {
+      list = h("ol", { class: "timeline" });
+      timeline(detail.events).forEach(function (item) {
+        list.append(h("li", null, h("span", { class: "dot " + item.tone }), h("div", { class: "item" },
+          h("div", { class: "head" },
+            h("span", { class: "kind", text: item.kind }),
+            h("span", { class: "title", text: item.title }),
+            item.child ? link(item.child) : null,
+            h("span", { class: "meta", text: clock(item.at) + (item.note ? " · " + item.note : "") })),
+          item.error ? h("pre", { class: "mono error", text: item.error }) : null,
+          item.body ? h("pre", { class: "mono", text: item.body }) : null)));
+      });
+    }
+    panel.replaceChildren(
+      h("div", { class: "bar" },
+        h("button", { class: "plain", text: "← All workflows", on: { click: function () { select(null); } } }),
+        h("span", { class: "spacer" }),
+        h("button", { class: "plain", text: state.raw ? "Show timeline" : "Show raw events (" + detail.events.length + ")",
+          on: { click: function () { state.raw = !state.raw; renderDetail(detail); } } })),
+      h("h2", { class: "mono", text: w.id }), facts, list);
+  }
+
+  function showDetailMessage(text) {
+    document.getElementById("detail").replaceChildren(
+      h("div", { class: "bar" }, h("button", { class: "plain", text: "← All workflows",
+        on: { click: function () { select(null); } } })),
+      h("div", { class: "empty", text: text }));
+  }
+
+  function refresh() {
+    var query = new URLSearchParams();
+    if (state.status) query.set("status", state.status);
+    if (state.q) query.set("q", state.q);
+    fetch(base + "/api/workflows?" + query).then(function (r) { return r.json(); }).then(function (listing) {
+      renderChips(listing.counts);
+      renderRows(listing.workflows);
+    }).catch(function () {
+      document.getElementById("empty").hidden = false;
+      document.getElementById("empty").textContent = "Could not reach the application.";
+    });
+
+    var main = document.getElementById("main"), panel = document.getElementById("detail");
+    main.classList.toggle("split", !!state.selected);
+    panel.hidden = !state.selected;
+    if (!state.selected) return;
+    var id = state.selected;
+    fetch(base + "/api/workflow?id=" + encodeURIComponent(id)).then(function (r) {
+      if (r.status === 404) { if (id === state.selected) showDetailMessage("There is no workflow with this id."); return null; }
+      return r.json();
+    }).then(function (detail) {
+      if (!detail || id !== state.selected) return;
+      // Leave the panel alone while nothing changed, so that scrolling and selections survive.
+      var fingerprint = detail.events.length + detail.workflow.status;
+      if (fingerprint === lastDetail && detail.workflow.status !== "RUNNING") return;
+      var scroll = panel.scrollTop;
+      lastDetail = fingerprint;
+      renderDetail(detail);
+      panel.scrollTop = scroll;
+    }).catch(function () { });
+  }
+
+  document.getElementById("search").addEventListener("input", function (e) { state.q = e.target.value; refresh(); });
+  window.addEventListener("hashchange", function () {
+    state.selected = location.hash ? decodeURIComponent(location.hash.slice(1)) : null;
+    lastDetail = null;
+    refresh();
+  });
+  state.selected = location.hash ? decodeURIComponent(location.hash.slice(1)) : null;
+  setInterval(function () {
+    if (document.getElementById("auto").checked && !document.hidden) refresh();
+  }, 2000);
+  refresh();
+})();
+</script>
+</body>
+</html>

@@ -198,6 +198,7 @@ at startup; otherwise they are kept in memory. Payloads are encoded with the app
 | `tenaz.poll-interval` | `50ms` | how often to look for work no notification announced |
 | `tenaz.max-concurrent-workflows` | `1000` | |
 | `tenaz.worker-id` | random | this engine's name in leases |
+| `tenaz.viewer.enabled` | `false` | serve the history viewer at `/tenaz` |
 
 [example](example) is a small order service built this way: an order is charged, waits for
 approval, and is shipped, or refunded if it is cancelled or nobody approves in time. To see an
@@ -216,6 +217,19 @@ curl localhost:8080/orders/<id>        # {"status":"COMPLETED","detail":"SHIPPED
 
 The order's history in the database shows the charge recorded once, before the restart, and the
 shipment after it.
+
+### History viewer
+
+With `tenaz.viewer.enabled=true`, a web application serves a page at `/tenaz` that lists
+workflows, filters them by status and id, and shows what happened in each: every step, timer,
+signal and child on one line, with how long it took and what it returned, and a link from parent
+to child and back. The example has it on.
+
+![The history viewer showing a cancelled order: charged, cancelled, refunded](docs/viewer.jpg)
+
+The viewer only reads. It has no access control of its own, so put `/tenaz` behind the
+application's security before enabling it anywhere that matters. The times it shows are when the
+journal recorded each event, by the journal's clock; nothing the engine decides depends on them.
 
 ## Benchmarks
 
@@ -284,7 +298,3 @@ apart, so treat every figure as an order of magnitude.
   deliver it twice.
 - The simulation covers the engine on the in-memory journal. `PostgresJournal` is covered by the
   contract, chaos and kill -9 tests instead.
-
-## Roadmap
-
-1. A history viewer

@@ -94,6 +94,13 @@ class TenazAutoConfigurationTest {
     }
 
     @Test
+    void theViewerIsOffUnlessAskedForAndNeedsAWebApplication() {
+        runner.run(context -> assertThat(context).doesNotHaveBean(TenazViewerController.class));
+        runner.withPropertyValues("tenaz.viewer.enabled=true")
+                .run(context -> assertThat(context).hasNotFailed().doesNotHaveBean(TenazViewerController.class));
+    }
+
+    @Test
     void aPostgresDataSourceMakesTheJournalDurable() {
         assumeTrue(DockerClientFactory.instance().isDockerAvailable(), "Docker is not available");
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17-alpine")) {

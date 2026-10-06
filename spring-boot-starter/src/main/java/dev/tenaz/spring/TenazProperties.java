@@ -34,6 +34,29 @@ public class TenazProperties {
     /** How many workflows this engine drives at the same time. */
     private int maxConcurrentWorkflows = 1000;
 
+    private final Viewer viewer = new Viewer();
+
+    public static class Viewer {
+
+        /**
+         * Whether to serve the history viewer at /tenaz. It is read-only but has no access
+         * control of its own: protect the path before enabling it anywhere that matters.
+         */
+        private boolean enabled;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+    }
+
+    public Viewer getViewer() {
+        return viewer;
+    }
+
     public JournalType getJournal() {
         return journal;
     }

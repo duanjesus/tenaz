@@ -4,6 +4,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
@@ -19,7 +21,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * Journal that lives in the heap. It survives the crash of any engine that uses it, which makes
  * it the reference implementation for tests; it does not survive the JVM.
  */
-public final class InMemoryJournal implements Journal {
+public final class InMemoryJournal implements Journal, JournalBrowser {
 
     // ReentrantLock rather than synchronized: virtual threads wait here without pinning carriers.
     private final ReentrantLock lock = new ReentrantLock();
@@ -33,6 +35,8 @@ public final class InMemoryJournal implements Journal {
     private static final class Entry {
         final String type;
         final List<Event> events = new ArrayList<>();
+        // When each event was recorded, by the wall clock: for display, never for decisions.
+        final List<Instant> recordedAt = new ArrayList<>();
         final Map<Integer, Instant> pendingTimers = new HashMap<>();
         WorkflowStatus status = WorkflowStatus.RUNNING;
         long epoch;
@@ -271,6 +275,61 @@ public final class InMemoryJournal implements Journal {
         }
     }
 
+    @Override
+    public List<WorkflowSummary> list(Filter filter, int limit) {
+        lock.lock();
+        try {
+            return workflows.entrySet().stream()
+                    .filter(e -> filter.type() == null || filter.type().equals(e.getValue().type))
+                    .filter(e -> filter.status() == null || filter.status() == e.getValue().status)
+                    .filter(e -> filter.idContains() == null
+                            || e.getKey().toLowerCase().contains(filter.idContains().toLowerCase()))
+                    .map(e -> summary(e.getKey(), e.getValue()))
+                    .sorted(Comparator.comparing(WorkflowSummary::startedAt).reversed()
+                            .thenComparing(WorkflowSummary::id))
+                    .limit(limit)
+                    .toList();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static WorkflowSummary summary(String id, Entry entry) {
+        Event.WorkflowStarted started = (Event.WorkflowStarted) entry.events.get(0);
+        return new WorkflowSummary(id, entry.type, entry.status, entry.events.size(), entry.recordedAt.get(0),
+                entry.recordedAt.get(entry.recordedAt.size() - 1), started.parentId());
+    }
+
+    @Override
+    public Map<WorkflowStatus, Long> countByStatus() {
+        lock.lock();
+        try {
+            Map<WorkflowStatus, Long> counts = new EnumMap<>(WorkflowStatus.class);
+            workflows.values().forEach(entry -> counts.merge(entry.status, 1L, Long::sum));
+            return counts;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public List<RecordedEvent> events(String workflowId) {
+        lock.lock();
+        try {
+            Entry entry = workflows.get(workflowId);
+            if (entry == null) {
+                return List.of();
+            }
+            List<RecordedEvent> recorded = new ArrayList<>();
+            for (int i = 0; i < entry.events.size(); i++) {
+                recorded.add(new RecordedEvent(i, entry.recordedAt.get(i), entry.events.get(i)));
+            }
+            return recorded;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private Entry owned(Lease lease) {
         Entry entry = workflows.get(lease.workflowId());
         if (!holds(entry, lease)) {
@@ -288,6 +347,7 @@ public final class InMemoryJournal implements Journal {
 
     private void append(String workflowId, Entry entry, Event event) {
         entry.events.add(event);
+        entry.recordedAt.add(Instant.now());
         // An event on a workflow nobody owns is work for someone to claim.
         candidates.add(workflowId);
         switch (event) {

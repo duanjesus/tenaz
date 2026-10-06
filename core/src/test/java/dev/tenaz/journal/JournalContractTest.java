@@ -150,4 +150,34 @@ abstract class JournalContractTest {
         assertEquals(Journal.WorkflowStatus.CANCELLED, journal.load("wf").orElseThrow().status());
         assertTrue(journal.claim("b", TYPES, TTL, T0.plusSeconds(60), 10).isEmpty());
     }
+
+    @Test
+    void workflowsCanBeListedFilteredAndInspected() {
+        create("order-1");
+        create("order-2");
+        Lease parent = journal.claim("a", TYPES, TTL, T0, 1).get(0);
+        journal.createChild(parent, "refund-1", new Event.WorkflowStarted("u", "null", T0, parent.workflowId(), 0));
+        journal.append(parent, 1, List.of(new Event.WorkflowCompleted("1")));
+        JournalBrowser browser = (JournalBrowser) journal;
+
+        assertEquals(3, browser.list(JournalBrowser.Filter.ALL, 10).size());
+        assertEquals(2, browser.list(JournalBrowser.Filter.ALL, 2).size());
+        assertEquals(List.of("refund-1"), ids(browser, new JournalBrowser.Filter("u", null, null)));
+        assertEquals(List.of(parent.workflowId()),
+                ids(browser, new JournalBrowser.Filter(null, Journal.WorkflowStatus.COMPLETED, null)));
+        assertEquals(List.of("refund-1"), ids(browser, new JournalBrowser.Filter(null, null, "REFUND")));
+        assertEquals(parent.workflowId(), browser.list(new JournalBrowser.Filter("u", null, null), 1).get(0).parentId());
+        assertEquals(1L, browser.countByStatus().get(Journal.WorkflowStatus.COMPLETED));
+        assertEquals(2L, browser.countByStatus().get(Journal.WorkflowStatus.RUNNING));
+
+        List<JournalBrowser.RecordedEvent> events = browser.events(parent.workflowId());
+        assertEquals(List.of(0L, 1L), events.stream().map(JournalBrowser.RecordedEvent::seq).toList());
+        assertEquals(new Event.WorkflowCompleted("1"), events.get(1).event());
+        assertTrue(events.get(0).recordedAt() != null && !events.get(1).recordedAt().isBefore(events.get(0).recordedAt()));
+        assertTrue(browser.events("nobody").isEmpty());
+    }
+
+    private static List<String> ids(JournalBrowser browser, JournalBrowser.Filter filter) {
+        return browser.list(filter, 10).stream().map(JournalBrowser.WorkflowSummary::id).toList();
+    }
 }

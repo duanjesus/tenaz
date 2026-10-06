@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -85,6 +87,28 @@ class OrderApplicationTest {
         assertThat(ended.detail()).isEqualTo("found it cheaper");
         assertThat(payments.refunds() - refundsBefore).isEqualTo(1);
         assertThat(warehouse.shipments() - shipmentsBefore).isZero();
+    }
+
+    @Test
+    void theViewerShowsAnOrdersHistory() throws Exception {
+        String id = place("mouse");
+        http.perform(post("/orders/{id}/approval", id).param("by", "bia")).andExpect(status().isAccepted());
+        awaitEnd(id);
+
+        http.perform(get("/tenaz")).andExpect(status().isOk())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_HTML));
+        http.perform(get("/tenaz/api/workflows").param("q", id).param("status", "COMPLETED"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.workflows[0].id").value(id))
+                .andExpect(jsonPath("$.workflows[0].type").value("order"))
+                .andExpect(jsonPath("$.counts.COMPLETED").isNumber());
+        http.perform(get("/tenaz/api/workflow").param("id", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.workflow.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.events[0].type").value("WorkflowStarted"))
+                .andExpect(jsonPath("$.events[1].data.name").value("charge"))
+                .andExpect(jsonPath("$.events[0].at").isString());
+        http.perform(get("/tenaz/api/workflow").param("id", "no-such-order")).andExpect(status().isNotFound());
     }
 
     @Test
