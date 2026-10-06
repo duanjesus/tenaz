@@ -35,7 +35,7 @@ first call it cannot answer, the code's virtual thread parks with its stack inta
 the engine feeds it new events and lets it run to the next unanswered call, so a step costs only
 its own work, however long the history behind it. When the engine lets go of the workflow, or
 dies, the stack is thrown away, and whoever picks the workflow up next rebuilds it by replay. See
-[Replay.java](src/main/java/dev/tenaz/engine/Replay.java).
+[Replay.java](core/src/main/java/dev/tenaz/engine/Replay.java).
 
 **Replay is deterministic by construction.** Workflow code can observe a pending result only by
 waiting on it, and `anyOf` picks its winner by position in the history, never by wall-clock
@@ -51,7 +51,7 @@ mid-replay forces a fresh replay instead of being ordered inconsistently.
 
 **The engine never touches the world directly.** It is a set of short, non-blocking tasks that get
 time, scheduling and step execution from an
-[EngineRuntime](src/main/java/dev/tenaz/engine/EngineRuntime.java). In production that is virtual
+[EngineRuntime](core/src/main/java/dev/tenaz/engine/EngineRuntime.java). In production that is virtual
 threads and the wall clock; under test it is a single-threaded event loop driven by a seed.
 
 ## Children, cancellation and code changes
@@ -100,7 +100,7 @@ where the live execution saw it.
 
 ## Evidence
 
-**Deterministic simulation.** [SimulationTest](src/test/java/dev/tenaz/sim/SimulationTest.java)
+**Deterministic simulation.** [SimulationTest](core/src/test/java/dev/tenaz/sim/SimulationTest.java)
 runs a three-node cluster inside one thread, with simulated time and every source of randomness
 drawn from one seed. For thirty simulated seconds, clients start, signal and cancel workflows, some
 of which run children, while nodes crash and restart, freeze for longer than their leases and wake
@@ -120,17 +120,21 @@ transfers that were cancelled halfway and had to refund.
 
 **Real processes.** The same test suites run against both journals.
 
-- [ChaosTest](src/test/java/dev/tenaz/ChaosTest.java) runs 300 money transfers on a three-node
+- [ChaosTest](core/src/test/java/dev/tenaz/ChaosTest.java) runs 300 money transfers on a three-node
   cluster while killing a random node 60 times, and asserts that every transfer completes and every
   debit and credit takes effect exactly once. A typical run forces 30 to 70 steps to execute twice;
   the balances still match to the cent.
-- [KillNineTest](src/test/java/dev/tenaz/KillNineTest.java) simulates nothing: the workers are
+- [KillNineTest](core/src/test/java/dev/tenaz/KillNineTest.java) simulates nothing: the workers are
   separate JVMs on PostgreSQL, and the operating system destroys one every second or so, with no
   chance to clean up. Same assertions, same result.
 
 ```
 ./mvnw test
 ```
+
+The repository has three modules: [core](core) is the engine and has no dependency on Spring,
+[spring-boot-starter](spring-boot-starter) is the auto-configuration, and [example](example) is
+the order service.
 
 The PostgreSQL tests start a container and are skipped when Docker is not available.
 
@@ -148,7 +152,70 @@ only if that update matched: one round trip, atomic, with the row lock serializi
 same workflow. A step therefore costs one commit, which carries its outcome together with whatever
 the workflow decided to do next. Workers claim work in batches with `FOR UPDATE SKIP LOCKED` and
 are woken by `LISTEN/NOTIFY`, with polling as a fallback. See
-[PostgresJournal.java](src/main/java/dev/tenaz/journal/PostgresJournal.java).
+[PostgresJournal.java](core/src/main/java/dev/tenaz/journal/PostgresJournal.java).
+
+## Spring Boot
+
+Add `tenaz-spring-boot-starter` and annotate the workflow. It becomes a bean, with its
+collaborators injected, and is registered with an engine the application can inject anywhere:
+
+```java
+@DurableWorkflow("order")
+public class OrderWorkflow implements Workflow<Order, String> {
+
+    private final PaymentGateway payments;
+
+    public OrderWorkflow(PaymentGateway payments) {
+        this.payments = payments;
+    }
+
+    @Override
+    public String run(WorkflowContext ctx, Order order) {
+        return ctx.step("charge", String.class,
+                step -> payments.charge(order.amountCents(), step.idempotencyKey()));
+    }
+}
+```
+
+```java
+@PostMapping("/orders")
+OrderStatus place(@RequestBody Order order) {
+    engine.start("order", UUID.randomUUID().toString(), order);
+    ...
+}
+```
+
+If the application has a PostgreSQL `DataSource`, histories go there and the tables are created
+at startup; otherwise they are kept in memory. Payloads are encoded with the application's own
+`ObjectMapper`. Every bean the starter defines steps aside for one of the application's.
+
+| Property | Default | |
+|---|---|---|
+| `tenaz.journal` | `auto` | `auto`, `postgres` or `memory` |
+| `tenaz.migrate` | `true` | create the `tenaz_*` tables if missing |
+| `tenaz.workers-enabled` | `true` | `false` for an application that only starts and signals workflows |
+| `tenaz.lease-ttl` | `10s` | how long a dead engine's workflows wait for a new owner |
+| `tenaz.poll-interval` | `50ms` | how often to look for work no notification announced |
+| `tenaz.max-concurrent-workflows` | `1000` | |
+| `tenaz.worker-id` | random | this engine's name in leases |
+
+[example](example) is a small order service built this way: an order is charged, waits for
+approval, and is shipped, or refunded if it is cancelled or nobody approves in time. To see an
+order outlive the process that started it:
+
+```
+docker compose -f example/docker-compose.yml up -d
+./mvnw -q install -DskipTests
+java -jar example/target/tenaz-example-0.1.0-SNAPSHOT.jar --spring.profiles.active=postgres
+
+curl -X POST localhost:8080/orders -H "Content-Type: application/json" -d '{"item":"keyboard","amountCents":4990}'
+# stop the application, start it again, then:
+curl -X POST "localhost:8080/orders/<id>/approval?by=ana"
+curl localhost:8080/orders/<id>        # {"status":"COMPLETED","detail":"SHIPPED TRK1000, approved by ana"}
+```
+
+The order's history in the database shows the charge recorded once, before the restart, and the
+shipment after it.
 
 ## Benchmarks
 
@@ -192,7 +259,7 @@ This laptop is noisy: the same benchmark has varied by a factor of two between r
 apart, so treat every figure as an order of magnitude.
 
 ```
-./mvnw -q test-compile exec:java -Dexec.mainClass=dev.tenaz.bench.Benchmark -Dexec.classpathScope=test
+./mvnw -q -pl core test-compile exec:java -Dexec.mainClass=dev.tenaz.bench.Benchmark -Dexec.classpathScope=test
 ```
 
 ## Limitations
@@ -220,5 +287,4 @@ apart, so treat every figure as an order of magnitude.
 
 ## Roadmap
 
-1. Spring Boot starter
-2. A history viewer
+1. A history viewer

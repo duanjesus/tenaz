@@ -1,0 +1,10 @@
+# A throwaway PostgreSQL for running the example with the "postgres" profile.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: tenaz
+      POSTGRES_USER: tenaz
+      POSTGRES_PASSWORD: tenaz
+    ports:
+      - "54329:5432"
