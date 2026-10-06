@@ -10,6 +10,13 @@
     <packaging>pom</packaging>
     <name>Tenaz (parent)</name>
 
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/license/mit</url>
+        </license>
+    </licenses>
+
     <modules>
         <module>core</module>
         <module>spring-boot-starter</module>

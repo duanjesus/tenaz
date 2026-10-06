@@ -298,3 +298,7 @@ apart, so treat every figure as an order of magnitude.
   deliver it twice.
 - The simulation covers the engine on the in-memory journal. `PostgresJournal` is covered by the
   contract, chaos and kill -9 tests instead.
+
+## License
+
+[MIT](LICENSE)
