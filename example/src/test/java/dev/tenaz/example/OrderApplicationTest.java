@@ -77,7 +77,13 @@ class OrderApplicationTest {
     void aCancelledOrderIsRefundedAndNeverShipped() throws Exception {
         int refundsBefore = payments.refunds();
         int shipmentsBefore = warehouse.shipments();
+        int chargesBefore = payments.charges();
         String id = place("monitor");
+        // An order cancelled before it was charged has nothing to refund; wait for the charge.
+        Instant deadline = Instant.now().plus(Duration.ofSeconds(10));
+        while (payments.charges() == chargesBefore && Instant.now().isBefore(deadline)) {
+            Thread.sleep(10);
+        }
 
         http.perform(delete("/orders/{id}", id).param("reason", "found it cheaper"))
                 .andExpect(status().isAccepted());
