@@ -112,6 +112,21 @@ class OrderApplicationTest {
     }
 
     @Test
+    void actuatorShowsTheEnginesHealthAndMetrics() throws Exception {
+        String id = place("cable");
+        http.perform(post("/orders/{id}/approval", id).param("by", "caio")).andExpect(status().isAccepted());
+        awaitEnd(id);
+
+        http.perform(get("/actuator/health")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.components.tenaz.status").value("UP"))
+                .andExpect(jsonPath("$.components.tenaz.details.journal").value("InMemoryJournal"));
+        http.perform(get("/actuator/metrics/tenaz.step.attempts").param("tag", "step:charge"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.measurements[?(@.statistic == 'COUNT')].value").isNotEmpty());
+        http.perform(get("/actuator/metrics/tenaz.leases.renewal")).andExpect(status().isOk());
+    }
+
+    @Test
     void anUnknownOrderIsNotFound() throws Exception {
         http.perform(get("/orders/{id}", "no-such-order")).andExpect(status().isNotFound());
     }

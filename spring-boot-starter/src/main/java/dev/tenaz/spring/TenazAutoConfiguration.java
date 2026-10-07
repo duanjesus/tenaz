@@ -3,17 +3,23 @@ package dev.tenaz.spring;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.tenaz.api.JacksonCodec;
 import dev.tenaz.api.PayloadCodec;
+import dev.tenaz.engine.EngineObserver;
 import dev.tenaz.engine.TenazEngine;
 import dev.tenaz.journal.InMemoryJournal;
 import dev.tenaz.journal.Journal;
 import dev.tenaz.journal.JournalBrowser;
 import dev.tenaz.journal.PostgresJournal;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.sql.Connection;
 import java.sql.SQLException;
 import javax.sql.DataSource;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.actuate.autoconfigure.health.ConditionalOnEnabledHealthIndicator;
+import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
@@ -28,7 +34,10 @@ import org.springframework.util.ClassUtils;
  */
 @AutoConfiguration(afterName = {
         "org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration",
-        "org.springframework.boot.autoconfigure.jackson.JacksonAutoConfiguration"})
+        "org.springframework.boot.autoconfigure.jackson.JacksonAutoConfiguration",
+        "org.springframework.boot.actuate.autoconfigure.metrics.MetricsAutoConfiguration",
+        "org.springframework.boot.actuate.autoconfigure.metrics.CompositeMeterRegistryAutoConfiguration",
+        "org.springframework.boot.actuate.autoconfigure.metrics.export.simple.SimpleMetricsExportAutoConfiguration"})
 @EnableConfigurationProperties(TenazProperties.class)
 public class TenazAutoConfiguration {
 
@@ -66,12 +75,14 @@ public class TenazAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    TenazEngine tenazEngine(Journal journal, PayloadCodec codec, TenazProperties properties) {
+    TenazEngine tenazEngine(Journal journal, PayloadCodec codec, TenazProperties properties,
+                            ObjectProvider<EngineObserver> observer) {
         TenazEngine.Builder builder = TenazEngine.builder(journal)
                 .codec(codec)
                 .leaseTtl(properties.getLeaseTtl())
                 .pollInterval(properties.getPollInterval())
                 .maxConcurrentWorkflows(properties.getMaxConcurrentWorkflows());
+        observer.ifAvailable(builder::observer);
         if (properties.getRetention() != null) {
             builder.retention(properties.getRetention());
         }
@@ -100,6 +111,30 @@ public class TenazAutoConfiguration {
                         + journal.getClass().getName() + " does not implement " + JournalBrowser.class.getName());
             }
             return new TenazViewerController(browser);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(MeterRegistry.class)
+    @ConditionalOnBean(MeterRegistry.class)
+    static class Metrics {
+
+        @Bean
+        @ConditionalOnMissingBean(EngineObserver.class)
+        TenazMetrics tenazMetrics(MeterRegistry registry, ObjectProvider<TenazEngine> engine) {
+            return new TenazMetrics(registry, engine);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(HealthIndicator.class)
+    @ConditionalOnEnabledHealthIndicator("tenaz")
+    static class HealthCheck {
+
+        @Bean
+        @ConditionalOnMissingBean
+        TenazHealthIndicator tenazHealthIndicator(TenazEngine engine, TenazProperties properties) {
+            return new TenazHealthIndicator(engine, properties.isWorkersEnabled());
         }
     }
 

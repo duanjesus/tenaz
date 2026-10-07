@@ -127,7 +127,9 @@ transfers that were cancelled halfway and had to refund.
   the balances still match to the cent.
 - [KillNineTest](core/src/test/java/dev/tenaz/KillNineTest.java) simulates nothing: the workers are
   separate JVMs on PostgreSQL, and the operating system destroys one every second or so, with no
-  chance to clean up. Same assertions, same result.
+  chance to clean up. Same assertions, same result. How many steps run twice in it varies widely
+  with how loaded the machine is (from none to most of them); the workers log every lease they
+  lose, and in a run with 171 repeats they lost none, so those repeats came from the kills.
 
 ```
 ./mvnw test
@@ -219,6 +221,31 @@ curl localhost:8080/orders/<id>        # {"status":"COMPLETED","detail":"SHIPPED
 
 The order's history in the database shows the charge recorded once, before the restart, and the
 shipment after it.
+
+### Metrics and health
+
+With Actuator on the classpath, the engine publishes Micrometer meters and a health indicator.
+
+| Meter | Tags | |
+|---|---|---|
+| `tenaz.workflows.active` | | workflows this engine is driving now |
+| `tenaz.workflows.claimed` | | workflows it took ownership of |
+| `tenaz.workflows.ended` | `type`, `status` | |
+| `tenaz.step.attempts` | `workflow`, `step`, `outcome` | count and duration of attempts; outcome is `completed`, `retried`, `failed` or `timed_out` |
+| `tenaz.leases.lost` | | workflows found to belong to another engine |
+| `tenaz.leases.renewal` | | how long renewing the leases takes |
+| `tenaz.journal.append` | | how long a write to a history takes |
+
+`tenaz.leases.lost` is the one to alert on. A lease is lost after a pause or a partition, which is
+the design working; a steady trickle on healthy engines means leases are expiring for no good
+reason, and every one of them makes steps run twice. An earlier version of this engine had exactly
+that bug, and it took a benchmark to notice.
+
+The `tenaz` health component is down when the engine cannot reach its journal, or has gone longer
+than a lease's lifetime without renewing its leases.
+
+Outside Spring, the same events are available by passing an
+[EngineObserver](core/src/main/java/dev/tenaz/engine/EngineObserver.java) to the engine's builder.
 
 ### History viewer
 

@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-07)
 
+- Observability: an `EngineObserver` reports claims, endings, step attempts, lost leases, lease
+  renewals and journal writes. The Spring Boot starter publishes them as Micrometer meters
+  (`tenaz.*`) and adds a `tenaz` health indicator.
 - Retention: `TenazEngine.Builder.retention` and `tenaz.retention` delete a workflow and its
   history a set time after it ends. PostgreSQL gains an `ended_at` column, added by `migrate()`.
 - Idempotent signals: `handle.signal(name, payload, key)`; of the signals sent with one key, a

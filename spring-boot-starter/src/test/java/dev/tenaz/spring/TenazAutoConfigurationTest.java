@@ -12,11 +12,16 @@ import dev.tenaz.engine.TenazEngine;
 import dev.tenaz.journal.InMemoryJournal;
 import dev.tenaz.journal.Journal;
 import dev.tenaz.journal.PostgresJournal;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.time.Duration;
 import javax.sql.DataSource;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.actuate.health.Health;
+import org.springframework.boot.actuate.health.Status;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.jackson.JacksonAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -98,6 +103,37 @@ class TenazAutoConfigurationTest {
         runner.run(context -> assertThat(context).doesNotHaveBean(TenazViewerController.class));
         runner.withPropertyValues("tenaz.viewer.enabled=true")
                 .run(context -> assertThat(context).hasNotFailed().doesNotHaveBean(TenazViewerController.class));
+    }
+
+    @Test
+    void withAMeterRegistryTheEnginePublishesMetrics() {
+        runner.withBean(MeterRegistry.class, SimpleMeterRegistry::new).run(context -> {
+            MeterRegistry registry = context.getBean(MeterRegistry.class);
+            context.getBean(TenazEngine.class).start("greet", "greet-5", "eva").result(TIMEOUT);
+
+            assertThat(registry.get("tenaz.step.attempts").tags("workflow", "greet", "step", "greet",
+                    "outcome", "completed").timer().count()).isEqualTo(1);
+            assertThat(registry.get("tenaz.workflows.active").gauge()).isNotNull();
+            assertThat(registry.get("tenaz.journal.append").timer().count()).isPositive();
+            Awaitility.await().atMost(TIMEOUT).untilAsserted(() -> assertThat(
+                    registry.get("tenaz.workflows.ended").tags("type", "greet", "status", "completed")
+                            .counter().count()).isEqualTo(1));
+        });
+    }
+
+    @Test
+    void theHealthIndicatorReportsTheJournalAndTheLeases() {
+        runner.run(context -> {
+            Health health = context.getBean(TenazHealthIndicator.class).health();
+
+            assertThat(health.getStatus()).isEqualTo(Status.UP);
+            assertThat(health.getDetails()).containsEntry("journal", "InMemoryJournal").containsKey("activeWorkflows");
+        });
+        runner.withPropertyValues("tenaz.workers-enabled=false").run(context ->
+                assertThat(context.getBean(TenazHealthIndicator.class).health().getDetails())
+                        .containsEntry("workers", "disabled"));
+        runner.withPropertyValues("management.health.tenaz.enabled=false")
+                .run(context -> assertThat(context).doesNotHaveBean(TenazHealthIndicator.class));
     }
 
     @Test

@@ -7,7 +7,7 @@
     <parent>
         <groupId>dev.tenaz</groupId>
         <artifactId>tenaz-parent</artifactId>
-        <version>0.2.0-SNAPSHOT</version>
+        <version>0.2.0</version>
     </parent>
 
     <artifactId>tenaz-spring-boot-starter</artifactId>
@@ -47,6 +47,17 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <!-- Only for metrics and the health check, in applications that have Actuator. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-actuator-autoconfigure</artifactId>
             <optional>true</optional>
         </dependency>
         <!-- Only for the history viewer, which exists only in web applications. -->

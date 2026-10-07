@@ -9,6 +9,7 @@ import dev.tenaz.api.Workflow;
 import dev.tenaz.api.WorkflowCancelledException;
 import dev.tenaz.api.WorkflowFailedException;
 import dev.tenaz.api.WorkflowHandle;
+import dev.tenaz.engine.EngineObserver.StepOutcome;
 import dev.tenaz.engine.Replay.ChildCancellation;
 import dev.tenaz.engine.Replay.Outcome;
 import dev.tenaz.engine.Replay.PendingChild;
@@ -28,6 +29,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
@@ -37,6 +39,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -66,6 +69,8 @@ public final class TenazEngine implements AutoCloseable {
     private final Duration leaseTtl;
     private final Duration pollInterval;
     private final Duration retention;
+    private final EngineObserver observer;
+    private volatile Instant lastLeaseRenewal;
     private final Semaphore slots;
     private final Map<String, WorkflowDefinition<?, ?>> definitions = new ConcurrentHashMap<>();
     // Ordered, so that a simulation visits sessions in the same order on every run.
@@ -84,6 +89,7 @@ public final class TenazEngine implements AutoCloseable {
         this.leaseTtl = builder.leaseTtl;
         this.pollInterval = builder.pollInterval;
         this.retention = builder.retention;
+        this.observer = builder.observer;
         this.slots = new Semaphore(builder.maxConcurrentWorkflows);
         this.dispatcher = new SerialTask(runtime, guarded(this::claimAvailable));
     }
@@ -228,6 +234,10 @@ public final class TenazEngine implements AutoCloseable {
                 sessions.put(lease, session);
                 session.wake();
             }
+            if (!leases.isEmpty()) {
+                int claimed = leases.size();
+                observe(o -> o.workflowsClaimed(claimed));
+            }
             if (leases.size() < wanted) {
                 return;
             }
@@ -259,13 +269,46 @@ public final class TenazEngine implements AutoCloseable {
 
     private void renewLeases() {
         List<Lease> held = List.copyOf(sessions.keySet());
-        Set<Lease> renewed = live().renew(held, leaseTtl, runtime.clock().instant());
+        Instant before = runtime.clock().instant();
+        Set<Lease> renewed = live().renew(held, leaseTtl, before);
+        Instant after = runtime.clock().instant();
+        lastLeaseRenewal = after;
+        observe(o -> o.leasesRenewed(renewed.size(), Duration.between(before, after)));
         for (Lease lease : held) {
             Session session = sessions.get(lease);
-            if (session != null && !renewed.contains(lease)) {
+            // A session that is handing its workflow back is not renewed either, and lost nothing.
+            if (session != null && !renewed.contains(lease) && !session.lettingGo && !session.ended) {
+                observe(o -> o.leaseLost(lease.workflowId()));
                 session.fence();
             }
         }
+    }
+
+    private void observe(Consumer<EngineObserver> event) {
+        try {
+            event.accept(observer);
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.DEBUG, "observer failed", e);
+        }
+    }
+
+    /** How many workflows this engine is driving right now. */
+    public int activeWorkflows() {
+        return sessions.size();
+    }
+
+    /** When this engine last renewed its leases, or empty if its workers have not done so yet. */
+    public Optional<Instant> lastLeaseRenewal() {
+        return Optional.ofNullable(lastLeaseRenewal);
+    }
+
+    public Duration leaseTtl() {
+        return leaseTtl;
+    }
+
+    /** The journal this engine works on. */
+    public Journal journal() {
+        return journal;
     }
 
     /**
@@ -294,6 +337,9 @@ public final class TenazEngine implements AutoCloseable {
         volatile boolean behind = true;
         volatile boolean fenced;
         volatile boolean ended;
+        // Set while the session is giving the workflow up of its own accord.
+        volatile boolean lettingGo;
+        volatile String workflowType = "unknown";
 
         Session(Lease lease) {
             this.lease = lease;
@@ -368,6 +414,7 @@ public final class TenazEngine implements AutoCloseable {
                 if (!(history.first() instanceof Event.WorkflowStarted started)) {
                     throw new IllegalStateException("workflow " + id + " has no history");
                 }
+                workflowType = started.workflowType();
                 // Outcomes that are not durable yet are replayed as if they were, so that they
                 // and the commands they lead to are journaled in a single append.
                 HistoryIndex view = history;
@@ -398,7 +445,10 @@ public final class TenazEngine implements AutoCloseable {
                         // In the same atomic append, so a parent cannot miss its child's outcome.
                         deliveries.add(new Delivery(started.parentId(), outcomeForParent(started.parentSeq(), ending)));
                     }
+                    lettingGo = true;
                     append(events, deliveries);
+                    WorkflowStatus status = WorkflowStatus.after(ending);
+                    observe(o -> o.workflowEnded(started.workflowType(), status));
                     end(true);
                     return;
                 }
@@ -432,14 +482,17 @@ public final class TenazEngine implements AutoCloseable {
                 }
                 replay.pendingChildren().forEach(this::startChild);
                 if (outstanding == 0 && arrived.isEmpty()) {
+                    lettingGo = true;
                     if (live().park(lease, history.version())) {
                         end(true);
                     } else {
+                        lettingGo = false;
                         behind = true;
                         wake();
                     }
                 }
             } catch (VersionConflictException e) {
+                lettingGo = false;
                 // A signal or timer landed since we last read the history. The code has already
                 // run ahead on outcomes that will now be journaled after that event, in an order
                 // it did not see, so its execution is rebuilt from the journal.
@@ -447,6 +500,7 @@ public final class TenazEngine implements AutoCloseable {
                 behind = true;
                 wake();
             } catch (FencedException e) {
+                observe(o -> o.leaseLost(id));
                 end(true);
             } catch (EngineDead e) {
                 ended = true;
@@ -462,7 +516,10 @@ public final class TenazEngine implements AutoCloseable {
         private void append(List<Event> events, List<Delivery> deliveries) {
             // Set first, so that the notification of our own append does not look like news.
             knownVersion = history.version() + events.size();
+            Instant before = runtime.clock().instant();
             live().append(lease, history.version(), events, deliveries);
+            Duration took = Duration.between(before, runtime.clock().instant());
+            observe(o -> o.journalAppended(events.size(), took));
         }
 
         private Event outcomeForParent(int seq, Event ending) {
@@ -525,9 +582,10 @@ public final class TenazEngine implements AutoCloseable {
             StepContext context = new StepContext(lease.workflowId() + "/" + step.seq(), attempt);
             // An attempt ends once: with its own outcome, or with the timeout, whichever is first.
             AtomicBoolean settled = new AtomicBoolean();
+            Instant begun = runtime.clock().instant();
             Runnable cancel = runtime.call(() -> step.body().apply(context), (result, error) -> guarded(() -> {
                 if (settled.compareAndSet(false, true)) {
-                    settle(step, attempt, backoff, result, error);
+                    settle(step, attempt, backoff, begun, result, error);
                 }
             }).run());
             synchronized (cancellations) {
@@ -538,24 +596,25 @@ public final class TenazEngine implements AutoCloseable {
                 runtime.schedule(timeout, guarded(() -> {
                     if (settled.compareAndSet(false, true)) {
                         cancel.run();
-                        settle(step, attempt, backoff, null, new StepTimeoutException(step.name(), timeout));
+                        settle(step, attempt, backoff, begun, null, new StepTimeoutException(step.name(), timeout));
                     }
                 }));
             }
         }
 
-        private void settle(PendingStep step, int attempt, Duration backoff, Object result, Throwable error) {
-            if (ended) {
+        private void settle(PendingStep step, int attempt, Duration backoff, Instant begun, Object result,
+                            Throwable error) {
+            if (ended || error instanceof InterruptedException) {
                 return;
             }
-            if (error == null) {
-                arrived.add(encodeResult(step, result));
-            } else if (error instanceof InterruptedException) {
-                return;
-            } else if (error instanceof NonRetryableException || attempt >= step.retry().maxAttempts()) {
-                arrived.add(new Event.StepFailed(
-                        step.seq(), error.getClass().getName(), String.valueOf(error.getMessage())));
-            } else {
+            boolean willRetry = error != null && !(error instanceof NonRetryableException)
+                    && attempt < step.retry().maxAttempts();
+            StepOutcome outcome = error == null ? StepOutcome.COMPLETED
+                    : error instanceof StepTimeoutException ? StepOutcome.TIMED_OUT
+                    : willRetry ? StepOutcome.RETRIED : StepOutcome.FAILED;
+            Duration took = Duration.between(begun, runtime.clock().instant());
+            observe(o -> o.stepAttempted(workflowType, step.name(), outcome, took));
+            if (willRetry) {
                 runtime.schedule(backoff, guarded(() -> {
                     if (!ended) {
                         attempt(step, attempt + 1, step.retry().next(backoff));
@@ -563,6 +622,8 @@ public final class TenazEngine implements AutoCloseable {
                 }));
                 return;
             }
+            arrived.add(error == null ? encodeResult(step, result) : new Event.StepFailed(
+                    step.seq(), error.getClass().getName(), String.valueOf(error.getMessage())));
             wake();
         }
 
@@ -653,6 +714,7 @@ public final class TenazEngine implements AutoCloseable {
         private Duration leaseTtl = Duration.ofSeconds(10);
         private Duration pollInterval = Duration.ofMillis(50);
         private Duration retention;
+        private EngineObserver observer = new EngineObserver() { };
         private int maxConcurrentWorkflows = 1000;
 
         private Builder(Journal journal) {
@@ -687,6 +749,12 @@ public final class TenazEngine implements AutoCloseable {
          * its history are deleted, and its id can be started again. Without this, nothing is
          * ever deleted.
          */
+        /** Receives the engine's events, for metrics. */
+        public Builder observer(EngineObserver observer) {
+            this.observer = observer;
+            return this;
+        }
+
         public Builder retention(Duration retention) {
             this.retention = retention;
             return this;
